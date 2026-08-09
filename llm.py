@@ -62,8 +62,18 @@ class OpenAIReasoner:
         return self._json(
             "You plan searches over the AWS Well-Architected Framework. Return JSON with "
             "search_query and reason. Target the most important information not yet supported. "
-            "Do not repeat prior searches.",
-            {"question": state.original_question, "searches": [s.model_dump() for s in state.searches], "evidence": evidence},
+            "Do not repeat or lightly paraphrase prior searches. For vague overview questions, "
+            "target introductory material such as the framework definition, purpose, or pillars. "
+            "When evidence is partial, change strategy to target the explicitly missing information. "
+            "If search_strategy_feedback is present, obey it and produce a meaningfully different query.",
+            {
+                "question": state.original_question,
+                "searches": [s.model_dump() for s in state.searches],
+                "rejected_duplicate_queries": state.rejected_search_queries,
+                "evidence": evidence,
+                "latest_assessment": state.assessments[-1].model_dump() if state.assessments else None,
+                "search_strategy_feedback": state.search_strategy_feedback,
+            },
             SearchDecision,
         )
 
@@ -100,6 +110,8 @@ class OpenAIReasoner:
 
 
 CONCEPTS = {
+    "framework overview and purpose": ("best practices", "consistent approach", "evaluate architectures", "understand the pros and cons"),
+    "framework pillars": ("six pillars", "operational excellence", "sustainability"),
     "reliability and failure preparation": ("failure", "failures", "reliable", "reliability", "resilien", "recover"),
     "cost optimization and avoiding unnecessary spend": ("cost", "expense", "spend", "unnecessary", "waste", "efficient", "idle", "oversized", "right size"),
     "security": ("security", "secure", "identity", "encrypt", "threat", "protect", "sensitive", "data protection"),
@@ -109,6 +121,8 @@ CONCEPTS = {
 }
 
 CONCEPT_SEARCH_TERMS = {
+    "framework overview and purpose": "framework introduction overview purpose definition",
+    "framework pillars": "six pillars definition",
     "reliability and failure preparation": "reliability failures recovery resilience fault isolation testing",
     "cost optimization and avoiding unnecessary spend": "cost optimization eliminate waste right size resources demand",
     "security": "security identity encryption threat protection",
@@ -127,6 +141,8 @@ CONCEPT_SECTIONS = {
 }
 
 CONCEPT_LABELS = {
+    "framework overview and purpose": "AWS Well-Architected Framework",
+    "framework pillars": "Six pillars",
     "reliability and failure preparation": "Reliability",
     "cost optimization and avoiding unnecessary spend": "Cost Optimization",
     "security": "Security",
@@ -138,6 +154,14 @@ CONCEPT_LABELS = {
 
 def _question_concepts(question: str) -> list[str]:
     lower = question.lower()
+    overview_patterns = (
+        r"\bwhat is (?:this|aws well[- ]architected)(?: about)?\b",
+        r"\bwhat does (?:this )?framework cover\b",
+        r"\bgive me an overview\b",
+        r"\boverview of (?:the )?(?:aws )?well[- ]architected framework\b",
+    )
+    if any(re.search(pattern, lower) for pattern in overview_patterns):
+        return ["framework overview and purpose", "framework pillars"]
     found = [name for name, terms in CONCEPTS.items() if any(term in lower for term in terms)]
     return found or [question]
 
@@ -171,6 +195,9 @@ class LocalReasoner:
             supported = self._supported(state)
             target = next((concept for concept in concepts if concept not in supported), concepts[-1])
         search_terms = CONCEPT_SEARCH_TERMS.get(target, target)
+        if state.search_strategy_feedback:
+            alternatives = ("core principles scope", "architectural guidance outcomes")
+            search_terms = f"{search_terms} {alternatives[len(state.rejected_search_queries) % len(alternatives)]}"
         return SearchDecision(
             search_query=f"AWS Well-Architected {search_terms}",
             reason=f"Need direct framework evidence about {target}."
@@ -236,6 +263,14 @@ class LocalReasoner:
                 clauses.append("test resilience and recovery processes regularly")
             if "disaster recovery" in lower or "rto" in lower or "rpo" in lower:
                 clauses.append("plan disaster recovery around business recovery objectives")
+        elif concept == "framework overview and purpose":
+            if "understand the pros and cons" in lower:
+                clauses.append("It helps teams understand architectural trade-offs when building systems on AWS")
+            if "best practices" in lower and ("measure" in lower or "evaluate" in lower):
+                clauses.append("it provides a consistent way to evaluate architectures against cloud best practices and identify improvements")
+        elif concept == "framework pillars":
+            if "six pillars" in lower:
+                clauses.append("It is organized around six pillars: operational excellence, security, reliability, performance efficiency, cost optimization, and sustainability")
         elif concept == "cost optimization and avoiding unnecessary spend":
             if "resource type, size, and number" in lower or "right size" in lower:
                 clauses.append("Select resource type, size, and count from workload data")

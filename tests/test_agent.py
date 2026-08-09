@@ -38,8 +38,8 @@ def test_trace_structure_is_valid():
 def test_max_iteration_limit_works():
     state, trace = Agent(FakeRetriever(), NeverEnough(), max_iterations=2).run("failure and cost")
     assert len(trace.iterations) == 2
-    assert state.stop_reason == "max_iterations"
-    assert trace.stop_reason == "max_iterations"
+    assert state.stop_reason == "no_new_evidence"
+    assert trace.stop_reason == "no_new_evidence"
 
 
 def test_retrieved_chunks_preserve_page_metadata():
@@ -94,6 +94,48 @@ def test_citation_validation_removes_invalid_citations_and_flags_uncited_claims(
     assert validation.uncited_claims == ["Use backups."]
 
 
+def test_duplicate_query_is_replanned_without_duplicate_retrieval():
+    reasoner = DuplicateThenReformulatedReasoner()
+    retriever = RecordingRetriever()
+    _, trace = Agent(retriever, reasoner, max_iterations=2).run("What does this framework cover?")
+    assert retriever.queries == ["framework overview purpose", "framework six pillars definition"]
+    assert trace.stop_reason == "sufficient_evidence"
+
+
+def test_duplicate_query_retries_stop_without_retrieving_again():
+    reasoner = AlwaysDuplicateReasoner()
+    retriever = RecordingRetriever()
+    _, trace = Agent(retriever, reasoner, max_iterations=4).run("What is this about?")
+    assert retriever.queries == ["framework overview purpose"]
+    assert trace.stop_reason == "no_new_search_strategy"
+    assert trace.total_iterations == 1
+
+
+def test_no_progress_stops_when_distinct_queries_return_same_chunks_and_coverage():
+    retriever = RecordingRetriever(always_same=True)
+    _, trace = Agent(retriever, DistinctQueryReasoner(), max_iterations=4).run("overview")
+    assert retriever.queries == ["framework overview purpose", "framework pillars definition"]
+    assert trace.stop_reason == "no_new_evidence"
+    assert trace.total_iterations == 2
+
+
+def test_vague_question_triggers_overview_search_and_cited_answer():
+    retriever = OverviewRetriever()
+    _, trace = Agent(retriever, LocalReasoner()).run("What is this about?")
+    query = trace.iterations[0].search_decision.search_query.lower()
+    assert "overview" in query or "introduction" in query or "definition" in query
+    assert trace.stop_reason == "sufficient_evidence"
+    assert "six pillars" in trace.final_answer.lower()
+    assert trace.citation_validation.valid is True
+
+
+def test_status_only_fallback_does_not_require_a_citation():
+    answer = "The evidence remained incomplete at the iteration limit, so no broader conclusion is asserted."
+    _, validation = Agent.validate_citations(answer, [])
+    assert validation.valid is True
+    assert validation.uncited_claims == []
+
+
 def test_empty_question_fails_cleanly():
     try:
         Agent(FakeRetriever(), LocalReasoner()).run("  ")
@@ -142,3 +184,73 @@ class FakeChoice:
 class FakeMessage:
     def __init__(self, content):
         self.content = content
+
+
+class RecordingRetriever:
+    def __init__(self, always_same=False):
+        self.queries = []
+        self.always_same = always_same
+
+    def search(self, query, k=6):
+        self.queries.append(query)
+        chunk_id = "same" if self.always_same else f"chunk-{len(self.queries)}"
+        return [EvidenceChunk(chunk_id=chunk_id, page=7, text="Partial framework evidence.", score=0.8)]
+
+
+class DuplicateThenReformulatedReasoner:
+    def __init__(self):
+        self.proposals = iter([
+            "framework overview purpose",
+            "framework overview purpose",
+            "framework six pillars definition",
+        ])
+
+    def decide_search(self, state):
+        return SearchDecision(search_query=next(self.proposals), reason="Need another framework aspect.")
+
+    def assess(self, state):
+        sufficient = len(state.searches) == 2
+        return EvidenceAssessment(
+            sufficient=sufficient,
+            reason="Complete." if sufficient else "Pillars missing.",
+            missing_information=[] if sufficient else ["framework pillars"],
+            supported_information=["framework overview and purpose"],
+        )
+
+    def answer(self, state):
+        return "The framework has an overview and pillars. [AWS-WAF p.7]"
+
+
+class AlwaysDuplicateReasoner(DuplicateThenReformulatedReasoner):
+    def __init__(self):
+        pass
+
+    def decide_search(self, state):
+        return SearchDecision(search_query="framework overview purpose", reason="Overview.")
+
+
+class DistinctQueryReasoner(DuplicateThenReformulatedReasoner):
+    def __init__(self):
+        self.proposals = iter(["framework overview purpose", "framework pillars definition"])
+
+    def assess(self, state):
+        return EvidenceAssessment(
+            sufficient=False,
+            reason="Purpose remains missing.",
+            missing_information=["purpose"],
+            supported_information=[],
+        )
+
+
+class OverviewRetriever:
+    def search(self, query, k=6):
+        return [EvidenceChunk(
+            chunk_id="overview",
+            page=8,
+            text=(
+                "The AWS Well-Architected Framework provides a consistent set of best practices "
+                "to evaluate architectures and is based on six pillars: operational excellence, "
+                "security, reliability, performance efficiency, cost optimization, and sustainability."
+            ),
+            score=0.9,
+        )]

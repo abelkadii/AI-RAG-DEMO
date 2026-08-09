@@ -67,9 +67,17 @@ class AgentState(BaseModel):
     original_question: str
     iteration: int = 0
     searches: list[SearchRecord] = Field(default_factory=list)
+    rejected_search_queries: list[str] = Field(default_factory=list)
+    search_strategy_feedback: str | None = None
     gathered_evidence: list[EvidenceChunk] = Field(default_factory=list)
     assessments: list[EvidenceAssessment] = Field(default_factory=list)
-    stop_reason: Literal["sufficient_evidence", "max_iterations", "no_evidence"] | None = None
+    stop_reason: Literal[
+        "sufficient_evidence",
+        "max_iterations",
+        "no_evidence",
+        "no_new_search_strategy",
+        "no_new_evidence",
+    ] | None = None
     final_answer: str | None = None
 
 
