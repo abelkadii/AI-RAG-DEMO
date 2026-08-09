@@ -9,7 +9,6 @@
 __pycache__/
 *.pyc
 data/*.pdf
-data/index/
 traces/
 .streamlit/secrets.toml
 output/
