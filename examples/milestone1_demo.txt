@@ -1,0 +1,115 @@
+============================================================
+AGENTIC DOCUMENT SEARCH
+============================================================
+
+QUESTION
+How should we design a customer-facing workload so it can recover from Availability Zone failures, protect sensitive customer data, and avoid paying for idle or oversized resources?
+
+------------------------------------------------------------
+ITERATION 1
+------------------------------------------------------------
+
+SEARCH
+AWS Well-Architected reliability failures recovery resilience fault isolation testing
+
+WHY
+Need direct framework evidence about reliability and failure preparation.
+
+EVIDENCE
++ Reliability - AWS-WAF p.44
++ Reliability - AWS-WAF p.572
++ Reliability - AWS-WAF p.640
++ Reliability - AWS-WAF p.468
+
+ASSESSMENT  x INSUFFICIENT
+
+SUPPORTED
++ Reliability / failure preparation
+
+MISSING
+- Cost Optimization
+- Security
+
+NEXT SEARCH
+AWS Well-Architected cost optimization eliminate waste right size resources demand
+
+------------------------------------------------------------
+ITERATION 2
+------------------------------------------------------------
+
+SEARCH
+AWS Well-Architected cost optimization eliminate waste right size resources demand
+
+WHY
+Need direct framework evidence about cost optimization and avoiding unnecessary spend.
+
+EVIDENCE
++ Cost Optimization - AWS-WAF p.859
++ Performance Efficiency - AWS-WAF p.682
++ Cost Optimization - AWS-WAF p.54
++ Cost Optimization - AWS-WAF p.794
+
+ASSESSMENT  x INSUFFICIENT
+
+SUPPORTED
++ Reliability / failure preparation
++ Cost Optimization
+
+MISSING
+- Security
+
+NEXT SEARCH
+AWS Well-Architected security identity encryption threat protection
+
+------------------------------------------------------------
+ITERATION 3
+------------------------------------------------------------
+
+SEARCH
+AWS Well-Architected security identity encryption threat protection
+
+WHY
+Need direct framework evidence about security.
+
+EVIDENCE
++ Security - AWS-WAF p.284
++ Security - AWS-WAF p.28
++ Security - AWS-WAF p.34
++ Security - AWS-WAF p.285
+
+ASSESSMENT  + SUFFICIENT
+
+SUPPORTED
++ Reliability / failure preparation
++ Cost Optimization
++ Security
+
+MISSING
+None
+
+============================================================
+STOP
+sufficient_evidence
+============================================================
+
+FINAL ANSWER
+
+Reliability
+Use fault-isolated boundaries to limit the impact of failures; test resilience and recovery processes regularly; plan disaster recovery around business recovery objectives. [AWS-WAF p.44]
+
+Cost Optimization
+Select resource type, size, and count from workload data; use cost modeling or proof-of-concept measurements before committing capacity; minimize waste from unnecessary or oversized resources. [AWS-WAF p.859]
+
+Security
+Apply identity and access management controls; protect sensitive data at rest and in transit; include infrastructure protection; use logging and monitoring for visibility. [AWS-WAF p.284]
+
+------------------------------------------------------------
+TRACE
+Saved: examples\milestone1_trace.json
+
+CITATIONS
++ All final citations validated against retrieved evidence
+
+TESTS
++ 11 passed
+============================================================

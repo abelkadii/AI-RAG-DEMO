@@ -1,0 +1,245 @@
+{
+  "question": "How should we design a customer-facing workload so it can recover from Availability Zone failures, protect sensitive customer data, and avoid paying for idle or oversized resources?",
+  "started_at": "2026-08-09T14:18:08.583222+00:00",
+  "completed_at": "2026-08-09T14:18:08.978206+00:00",
+  "duration_ms": 394,
+  "iterations": [
+    {
+      "iteration": 1,
+      "search_decision": {
+        "query": "AWS Well-Architected reliability failures recovery resilience fault isolation testing",
+        "reason": "Need direct framework evidence about reliability and failure preparation."
+      },
+      "retrieved": [
+        {
+          "chunk_id": "aws-waf-p044-c00",
+          "page": 44,
+          "score": 0.489,
+          "section": "Reliability",
+          "text_preview": "REL 10: How do you use fault isolation to protect your workload? Fault isolated boundaries limit the effect of a failure within a workload to a limited number of components. Components outside of the boundary are unaffected by the failure. "
+        },
+        {
+          "chunk_id": "aws-waf-p572-c01",
+          "page": 572,
+          "score": 0.3854,
+          "section": "Reliability",
+          "text_preview": "to help you get started with your planning and testing. • Chaos engineering experiments introduce disruptions to the system, such as network outages and service failures. By simulating with controlled failures, you can discover your system'"
+        },
+        {
+          "chunk_id": "aws-waf-p572-c00",
+          "page": 572,
+          "score": 0.3668,
+          "section": "Reliability",
+          "text_preview": "• Include updates to your disaster recovery plans and standard operating procedures (SOPs) with any significant deployment. • Integrate reliability testing into your automated deployment pipelines. Services such asAWS Resilience Hubcan be i"
+        },
+        {
+          "chunk_id": "aws-waf-p640-c00",
+          "page": 640,
+          "score": 0.3655,
+          "section": "Reliability",
+          "text_preview": "• Use infrastructure as code concepts to create an environment as similar to your production environment as possible. Resources Related documents: • Distributed Load Testing on AWS: simulate thousands of connected users • Apache JMeter REL1"
+        },
+        {
+          "chunk_id": "aws-waf-p468-c00",
+          "page": 468,
+          "score": 0.3589,
+          "section": "Reliability",
+          "text_preview": "• As you design your application, review your workload’s business and technology drivers, such as business outcomes, use case, dependent systems, availability targets, and disaster recovery objects. Let your business and technology drivers "
+        },
+        {
+          "chunk_id": "aws-waf-p615-c00",
+          "page": 615,
+          "score": 0.3442,
+          "section": "Reliability",
+          "text_preview": "• Configure lower environments (like development or test) with all services that are required to have a failover plan. Deploy the solutions using infrastructure as code (IaC) to ensure repeatability. • Configure a recovery site such as a se"
+        }
+      ],
+      "assessment": {
+        "sufficient": false,
+        "reason": "Supported: reliability and failure preparation. Still missing: cost optimization and avoiding unnecessary spend, security.",
+        "missing_information": [
+          "cost optimization and avoiding unnecessary spend",
+          "security"
+        ],
+        "suggested_next_search": "AWS Well-Architected cost optimization eliminate waste right size resources demand",
+        "supported_information": [
+          "reliability and failure preparation"
+        ],
+        "partially_supported_information": [
+          "cost optimization and avoiding unnecessary spend"
+        ],
+        "unsupported_information": [
+          "security"
+        ]
+      }
+    },
+    {
+      "iteration": 2,
+      "search_decision": {
+        "query": "AWS Well-Architected cost optimization eliminate waste right size resources demand",
+        "reason": "Need direct framework evidence about cost optimization and avoiding unnecessary spend."
+      },
+      "retrieved": [
+        {
+          "chunk_id": "aws-waf-p859-c00",
+          "page": 859,
+          "score": 0.4417,
+          "section": "Cost Optimization",
+          "text_preview": "• Perform cost modeling for resources: Deploy the workload or a proof of concept into a separate account with the specific resource types and sizes to test. Run the workload with the test data and record the output results, along with the c"
+        },
+        {
+          "chunk_id": "aws-waf-p682-c00",
+          "page": 682,
+          "score": 0.4333,
+          "section": "Performance Efficiency",
+          "text_preview": "• You do not evaluate licensed solutions against open-source solutions. • You do not define storage lifecycle policies. • You do not review new services and features of the AWS Cloud. • You only use block storage. Benefits of establishing t"
+        },
+        {
+          "chunk_id": "aws-waf-p054-c00",
+          "page": 54,
+          "score": 0.4108,
+          "section": "Cost Optimization",
+          "text_preview": "workload owners. This helps measure return on investment (ROI) and gives workload owners an opportunity to optimize their resources and reduce costs. Definition There are five best practice areas for cost optimization in the cloud: • Practi"
+        },
+        {
+          "chunk_id": "aws-waf-p794-c00",
+          "page": 794,
+          "score": 0.3866,
+          "section": "Cost Optimization",
+          "text_preview": "utilization. This helps organizations to understand how their Savings Plans apply to each hour of spend without having to invest time and resources into building models to analyze their spend. Periodically create reports containing a highli"
+        },
+        {
+          "chunk_id": "aws-waf-p058-c00",
+          "page": 58,
+          "score": 0.3856,
+          "section": "Cost Optimization",
+          "text_preview": "Demand pricing. Spot Instances are appropriate where the system can tolerate using a fleet of servers where individual servers can come and go dynamically, such as stateless web servers, batch processing, or when using HPC and big data. App"
+        },
+        {
+          "chunk_id": "aws-waf-p861-c00",
+          "page": 861,
+          "score": 0.3791,
+          "section": "Cost Optimization",
+          "text_preview": "a previous version of the workload (such as an on-premises version), using documentation, or using other sources of information about the workload (whitepapers or published solutions). Using AWS pricing calculators or cost management tools "
+        }
+      ],
+      "assessment": {
+        "sufficient": false,
+        "reason": "Supported: reliability and failure preparation, cost optimization and avoiding unnecessary spend. Still missing: security.",
+        "missing_information": [
+          "security"
+        ],
+        "suggested_next_search": "AWS Well-Architected security identity encryption threat protection",
+        "supported_information": [
+          "reliability and failure preparation",
+          "cost optimization and avoiding unnecessary spend"
+        ],
+        "partially_supported_information": [],
+        "unsupported_information": [
+          "security"
+        ]
+      }
+    },
+    {
+      "iteration": 3,
+      "search_decision": {
+        "query": "AWS Well-Architected security identity encryption threat protection",
+        "reason": "Need direct framework evidence about security."
+      },
+      "retrieved": [
+        {
+          "chunk_id": "aws-waf-p284-c01",
+          "page": 284,
+          "score": 0.379,
+          "section": "Security",
+          "text_preview": "in your threat model. For security control mitigations for the AWS services themselves, you want to consider implementing security controls across domains, including domains such as identity and access management (authentication and authori"
+        },
+        {
+          "chunk_id": "aws-waf-p028-c00",
+          "page": 28,
+          "score": 0.3652,
+          "section": "Security",
+          "text_preview": "• Security foundations • Identity and access management • Detection • Infrastructure protection • Data protection • Incident response • Application security Before you architect any workload, you need to put in place practices that influenc"
+        },
+        {
+          "chunk_id": "aws-waf-p034-c00",
+          "page": 34,
+          "score": 0.3487,
+          "section": "Security",
+          "text_preview": "SEC 5: How do you protect your network resources? Any workload that has some form of network connectivity, whether it’s the internet or a private network, requires multiple layers of defense to help protect from external and internal networ"
+        },
+        {
+          "chunk_id": "aws-waf-p285-c00",
+          "page": 285,
+          "score": 0.3441,
+          "section": "Security",
+          "text_preview": "Threat Composer To aid and guide you in performing threat modeling, consider using the Threat Composer tool, which aims to your reduce time-to-value when threat modeling. The tool helps you do the following: • Write useful threat statements"
+        },
+        {
+          "chunk_id": "aws-waf-p263-c00",
+          "page": 263,
+          "score": 0.3242,
+          "section": "Operational Excellence",
+          "text_preview": "Resources Related best practices: • OPS05-BP08 Use multiple environments Related videos: • AWS re:Invent 2023 - Improve application resilience with AWS Fault Injection Service Security The Security pillar encompasses the ability to protect "
+        },
+        {
+          "chunk_id": "aws-waf-p303-c00",
+          "page": 303,
+          "score": 0.3113,
+          "section": "Security",
+          "text_preview": "Resources Related Well-Architected best practices: • SEC02-BP06 Employ user groups and attributes • SEC03-BP02 Grant least privilege access • SEC03-BP06 Manage access based on lifecycle Related documents: • Identity federation in AWS • Secu"
+        }
+      ],
+      "assessment": {
+        "sufficient": true,
+        "reason": "Supported: reliability and failure preparation, cost optimization and avoiding unnecessary spend, security.",
+        "missing_information": [],
+        "suggested_next_search": null,
+        "supported_information": [
+          "reliability and failure preparation",
+          "cost optimization and avoiding unnecessary spend",
+          "security"
+        ],
+        "partially_supported_information": [],
+        "unsupported_information": []
+      }
+    }
+  ],
+  "total_iterations": 3,
+  "total_unique_evidence_chunks": 18,
+  "stop_reason": "sufficient_evidence",
+  "final_answer": "Reliability\nUse fault-isolated boundaries to limit the impact of failures; test resilience and recovery processes regularly; plan disaster recovery around business recovery objectives. [AWS-WAF p.44]\n\nCost Optimization\nSelect resource type, size, and count from workload data; use cost modeling or proof-of-concept measurements before committing capacity; minimize waste from unnecessary or oversized resources. [AWS-WAF p.859]\n\nSecurity\nApply identity and access management controls; protect sensitive data at rest and in transit; include infrastructure protection; use logging and monitoring for visibility. [AWS-WAF p.284]",
+  "citations": [
+    "[AWS-WAF p.44]",
+    "[AWS-WAF p.284]",
+    "[AWS-WAF p.859]"
+  ],
+  "citation_validation": {
+    "valid": true,
+    "cited_pages": [
+      44,
+      284,
+      859
+    ],
+    "retrieved_pages": [
+      28,
+      34,
+      44,
+      54,
+      58,
+      263,
+      284,
+      285,
+      303,
+      468,
+      572,
+      615,
+      640,
+      682,
+      794,
+      859,
+      861
+    ],
+    "uncited_claims": []
+  }
+}

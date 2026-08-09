@@ -1,0 +1,16 @@
+.env
+.venv/
+.python/
+.uv-cache/
+.pytest_cache/
+.pytest-*/
+.pytest-streamlit*/
+.pytest-tmp*/
+__pycache__/
+*.pyc
+data/*.pdf
+data/index/
+traces/
+.streamlit/secrets.toml
+output/
+streamlit-startup*.log

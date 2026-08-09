@@ -1,0 +1,287 @@
+"""OpenAI-compatible reasoning, plus an offline fallback for a zero-secret demo."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+from typing import Protocol
+
+from pydantic import ValidationError
+
+from models import AgentState, EvidenceAssessment, EvidenceChunk, SearchDecision
+
+
+class Reasoner(Protocol):
+    def decide_search(self, state: AgentState) -> SearchDecision: ...
+    def assess(self, state: AgentState) -> EvidenceAssessment: ...
+    def answer(self, state: AgentState) -> str: ...
+
+
+class OpenAIReasoner:
+    def __init__(self) -> None:
+        from openai import OpenAI
+
+        self.model = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
+        self.max_json_tokens = int(os.getenv("OPENAI_JSON_MAX_TOKENS", "500"))
+        self.max_answer_tokens = int(os.getenv("OPENAI_ANSWER_MAX_TOKENS", "900"))
+        self.client = OpenAI(
+            api_key=os.environ["OPENAI_API_KEY"],
+            base_url=os.getenv("OPENAI_BASE_URL") or None,
+        )
+
+    def _json(self, system: str, payload: dict, schema: type):
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    response_format={"type": "json_object"},
+                    temperature=0,
+                    max_tokens=getattr(self, "max_json_tokens", 500),
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": json.dumps(payload)},
+                    ],
+                )
+                content = response.choices[0].message.content or ""
+                return schema.model_validate_json(content)
+            except (ValidationError, json.JSONDecodeError, ValueError, TypeError, KeyError, IndexError) as error:
+                last_error = error
+                system = (
+                    system
+                    + " Return only valid JSON matching the requested schema. "
+                    + f"This is retry {attempt + 1}."
+                )
+            except Exception as error:
+                raise RuntimeError(f"Model request failed: {error}") from error
+        raise RuntimeError(f"Model returned malformed structured output after retry: {last_error}") from last_error
+
+    def decide_search(self, state: AgentState) -> SearchDecision:
+        evidence = [_evidence_payload(item, 600) for item in state.gathered_evidence]
+        return self._json(
+            "You plan searches over the AWS Well-Architected Framework. Return JSON with "
+            "search_query and reason. Target the most important information not yet supported. "
+            "Do not repeat prior searches.",
+            {"question": state.original_question, "searches": [s.model_dump() for s in state.searches], "evidence": evidence},
+            SearchDecision,
+        )
+
+    def assess(self, state: AgentState) -> EvidenceAssessment:
+        return self._json(
+            "Assess whether the supplied AWS evidence fully supports a cited answer to the question. "
+            "Break the original question into material parts and track each part as supported, "
+            "partially_supported, or unsupported. Stop only when all material parts are supported by "
+            "specific supplied evidence. Return JSON with sufficient, reason, missing_information, "
+            "suggested_next_search (null if sufficient), supported_information, "
+            "partially_supported_information, and unsupported_information.",
+            {"question": state.original_question, "evidence": [_evidence_payload(e, 1200) for e in state.gathered_evidence]},
+            EvidenceAssessment,
+        )
+
+    def answer(self, state: AgentState) -> str:
+        if not state.gathered_evidence:
+            raise ValueError("Cannot generate a final answer with zero evidence")
+        prompt = {
+            "question": state.original_question,
+            "evidence": [_evidence_payload(e, 1600) for e in state.gathered_evidence],
+            "evidence_sufficient": state.stop_reason == "sufficient_evidence",
+        }
+        response = self.client.chat.completions.create(
+            model=self.model,
+            temperature=0,
+            max_tokens=getattr(self, "max_answer_tokens", 900),
+            messages=[
+                {"role": "system", "content": "Answer only from supplied evidence. Support every major claim with a page citation exactly like [AWS-WAF p.42]. If evidence_sufficient is false, explicitly identify the limitation. Never invent facts."},
+                {"role": "user", "content": json.dumps(prompt)},
+            ],
+        )
+        return response.choices[0].message.content or ""
+
+
+CONCEPTS = {
+    "reliability and failure preparation": ("failure", "failures", "reliable", "reliability", "resilien", "recover"),
+    "cost optimization and avoiding unnecessary spend": ("cost", "expense", "spend", "unnecessary", "waste", "efficient", "idle", "oversized", "right size"),
+    "security": ("security", "secure", "identity", "encrypt", "threat", "protect", "sensitive", "data protection"),
+    "performance efficiency": ("performance", "latency", "throughput", "efficient"),
+    "operational excellence": ("operation", "deploy", "observe", "monitor"),
+    "sustainability": ("sustainab", "environment", "carbon"),
+}
+
+CONCEPT_SEARCH_TERMS = {
+    "reliability and failure preparation": "reliability failures recovery resilience fault isolation testing",
+    "cost optimization and avoiding unnecessary spend": "cost optimization eliminate waste right size resources demand",
+    "security": "security identity encryption threat protection",
+    "performance efficiency": "performance efficiency latency throughput resources",
+    "operational excellence": "operational excellence observe monitor improve operations",
+    "sustainability": "sustainability environmental impact resource efficiency",
+}
+
+CONCEPT_SECTIONS = {
+    "reliability and failure preparation": "Reliability",
+    "cost optimization and avoiding unnecessary spend": "Cost Optimization",
+    "security": "Security",
+    "performance efficiency": "Performance Efficiency",
+    "operational excellence": "Operational Excellence",
+    "sustainability": "Sustainability",
+}
+
+CONCEPT_LABELS = {
+    "reliability and failure preparation": "Reliability",
+    "cost optimization and avoiding unnecessary spend": "Cost Optimization",
+    "security": "Security",
+    "performance efficiency": "Performance Efficiency",
+    "operational excellence": "Operational Excellence",
+    "sustainability": "Sustainability",
+}
+
+
+def _question_concepts(question: str) -> list[str]:
+    lower = question.lower()
+    found = [name for name, terms in CONCEPTS.items() if any(term in lower for term in terms)]
+    return found or [question]
+
+
+def _concept_label(concept: str) -> str:
+    return CONCEPT_LABELS.get(concept, concept.title())
+
+
+class LocalReasoner:
+    """Transparent heuristic fallback. It plans by uncovered question concepts."""
+
+    def _evidence_hits(self, state: AgentState, concept: str) -> list[EvidenceChunk]:
+        terms = CONCEPTS.get(concept, (concept,))
+        expected_section = CONCEPT_SECTIONS.get(concept)
+        hits = []
+        for chunk in state.gathered_evidence:
+            text = chunk.text.lower()
+            section_matches = not expected_section or not chunk.section or chunk.section == expected_section
+            if section_matches and any(term in text for term in terms):
+                hits.append(chunk)
+        return hits
+
+    def _supported(self, state: AgentState) -> set[str]:
+        return {concept for concept in _question_concepts(state.original_question) if self._evidence_hits(state, concept)}
+
+    def decide_search(self, state: AgentState) -> SearchDecision:
+        concepts = _question_concepts(state.original_question)
+        if state.assessments and state.assessments[-1].missing_information:
+            target = state.assessments[-1].missing_information[0]
+        else:
+            supported = self._supported(state)
+            target = next((concept for concept in concepts if concept not in supported), concepts[-1])
+        search_terms = CONCEPT_SEARCH_TERMS.get(target, target)
+        return SearchDecision(
+            search_query=f"AWS Well-Architected {search_terms}",
+            reason=f"Need direct framework evidence about {target}."
+        )
+
+    def assess(self, state: AgentState) -> EvidenceAssessment:
+        concepts = _question_concepts(state.original_question)
+        supported = sorted(self._supported(state), key=concepts.index)
+        missing = [concept for concept in concepts if concept not in supported]
+        gathered_text = " ".join(chunk.text.lower() for chunk in state.gathered_evidence)
+        partial = [
+            concept for concept in missing
+            if any(word in gathered_text for word in re.findall(r"[a-z]+", concept))
+        ]
+        unsupported = [concept for concept in missing if concept not in partial]
+        enough = bool(state.gathered_evidence) and not missing
+        return EvidenceAssessment(
+            sufficient=enough,
+            reason=(
+                f"Supported: {', '.join(supported)}."
+                if enough else f"Supported: {', '.join(supported) or 'none'}. Still missing: {', '.join(missing)}."
+            ),
+            missing_information=missing,
+            suggested_next_search=f"AWS Well-Architected {CONCEPT_SEARCH_TERMS.get(missing[0], missing[0])}" if missing else None,
+            supported_information=supported,
+            partially_supported_information=partial,
+            unsupported_information=unsupported,
+        )
+
+    def answer(self, state: AgentState) -> str:
+        if not state.gathered_evidence:
+            raise ValueError("Cannot generate a final answer with zero evidence")
+        lines = []
+        for concept in _question_concepts(state.original_question):
+            statement = self._statement_for_concept(state, concept)
+            if statement:
+                lines.extend([_concept_label(concept), statement, ""])
+        if state.stop_reason != "sufficient_evidence":
+            lines.append("The evidence remained incomplete at the iteration limit, so no broader conclusion is asserted.")
+        return "\n".join(lines).strip()
+
+    def _statement_for_concept(self, state: AgentState, concept: str) -> str | None:
+        hits = self._evidence_hits(state, concept)
+        if not hits:
+            return None
+        combined = " ".join(chunk.text for chunk in hits)
+        clauses = self._evidence_clauses(concept, combined)
+        if not clauses:
+            sentence = self._best_sentence(concept, hits)
+            clauses = [sentence] if sentence else []
+        if not clauses:
+            return None
+        chunk = hits[0]
+        return f"{'; '.join(clauses)}. [{chunk.source} p.{chunk.page}]"
+
+    def _evidence_clauses(self, concept: str, text: str) -> list[str]:
+        lower = text.lower()
+        clauses = []
+        if concept == "reliability and failure preparation":
+            if "fault isolated boundaries" in lower:
+                clauses.append("Use fault-isolated boundaries to limit the impact of failures")
+            if "test" in lower and ("recovery" in lower or "resilien" in lower):
+                clauses.append("test resilience and recovery processes regularly")
+            if "disaster recovery" in lower or "rto" in lower or "rpo" in lower:
+                clauses.append("plan disaster recovery around business recovery objectives")
+        elif concept == "cost optimization and avoiding unnecessary spend":
+            if "resource type, size, and number" in lower or "right size" in lower:
+                clauses.append("Select resource type, size, and count from workload data")
+            if "cost modeling" in lower:
+                clauses.append("use cost modeling or proof-of-concept measurements before committing capacity")
+            if "minimize waste" in lower or "waste" in lower:
+                clauses.append("minimize waste from unnecessary or oversized resources")
+        elif concept == "security":
+            if "identity and access management" in lower:
+                clauses.append("Apply identity and access management controls")
+            if "data protection" in lower:
+                clauses.append("protect sensitive data at rest and in transit")
+            if "infrastructure security" in lower or "infrastructure protection" in lower:
+                clauses.append("include infrastructure protection")
+            if "logging" in lower or "monitoring" in lower:
+                clauses.append("use logging and monitoring for visibility")
+        return clauses[:4]
+
+    def _best_sentence(self, concept: str, hits: list[EvidenceChunk]) -> str | None:
+        terms = set(re.findall(r"[a-z]+", CONCEPT_SEARCH_TERMS.get(concept, concept)))
+        candidates = []
+        for chunk in hits:
+            for sentence in re.split(r"(?<=[.!?])\s+|\s*-\s+", chunk.text.strip()):
+                sentence = sentence.strip()
+                lower_sentence = sentence.lower()
+                if not lower_sentence or lower_sentence.startswith(("resources", "related documents", "related videos", "related examples")):
+                    continue
+                score = len(terms & set(re.findall(r"[a-z]+", lower_sentence)))
+                if score and 45 <= len(sentence) <= 240:
+                    candidates.append((score, chunk.score, sentence.rstrip(".")))
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: (item[0], item[1]))[2]
+
+
+def configured_reasoner() -> Reasoner:
+    mode = os.getenv("LLM_MODE", "auto").lower()
+    if mode != "local" and os.getenv("OPENAI_API_KEY"):
+        return OpenAIReasoner()
+    return LocalReasoner()
+
+
+def _evidence_payload(chunk: EvidenceChunk, limit: int) -> dict:
+    return {
+        "chunk_id": chunk.chunk_id,
+        "page": chunk.page,
+        "section": chunk.section,
+        "text": chunk.text[:limit],
+    }
