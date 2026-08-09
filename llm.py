@@ -59,15 +59,19 @@ class OpenAIReasoner:
 
     def decide_search(self, state: AgentState) -> SearchDecision:
         evidence = [_evidence_payload(item, 600) for item in state.gathered_evidence]
+        overview = overview_context(state)
         return self._json(
             "You plan searches over the AWS Well-Architected Framework. Return JSON with "
             "search_query and reason. Target the most important information not yet supported. "
-            "Do not repeat or lightly paraphrase prior searches. For vague overview questions, "
-            "target introductory material such as the framework definition, purpose, or pillars. "
+            "Do not repeat or lightly paraphrase prior searches. If overview_context is present, "
+            "ignore vague phrasing as a retrieval target and plan from normalized_information_need. "
+            "Choose a meaningfully different unresolved search strategy, preferring introduction, "
+            "framework definition, purpose, pillars, and framework use evidence. "
             "When evidence is partial, change strategy to target the explicitly missing information. "
             "If search_strategy_feedback is present, obey it and produce a meaningfully different query.",
             {
                 "question": state.original_question,
+                "overview_context": overview,
                 "searches": [s.model_dump() for s in state.searches],
                 "rejected_duplicate_queries": state.rejected_search_queries,
                 "evidence": evidence,
@@ -78,14 +82,21 @@ class OpenAIReasoner:
         )
 
     def assess(self, state: AgentState) -> EvidenceAssessment:
+        overview = overview_context(state)
         return self._json(
             "Assess whether the supplied AWS evidence fully supports a cited answer to the question. "
             "Break the original question into material parts and track each part as supported, "
             "partially_supported, or unsupported. Stop only when all material parts are supported by "
-            "specific supplied evidence. Return JSON with sufficient, reason, missing_information, "
+            "specific supplied evidence, except overview_context questions are broad: sufficient evidence "
+            "can establish what the framework is for and/or what it broadly covers or its pillars. "
+            "Return JSON with sufficient, reason, missing_information, "
             "suggested_next_search (null if sufficient), supported_information, "
             "partially_supported_information, and unsupported_information.",
-            {"question": state.original_question, "evidence": [_evidence_payload(e, 1200) for e in state.gathered_evidence]},
+            {
+                "question": state.original_question,
+                "overview_context": overview,
+                "evidence": [_evidence_payload(e, 1200) for e in state.gathered_evidence],
+            },
             EvidenceAssessment,
         )
 
@@ -131,6 +142,29 @@ CONCEPT_SEARCH_TERMS = {
     "sustainability": "sustainability environmental impact resource efficiency",
 }
 
+OVERVIEW_INFORMATION_NEED = (
+    "AWS Well-Architected Framework overview: what the framework is for, what it covers, "
+    "its core structure or pillars, and how it is used to evaluate architectures."
+)
+
+OVERVIEW_SEARCH_STRATEGIES = (
+    {
+        "target": "framework overview and purpose",
+        "query_terms": "framework overview purpose introduction definition",
+        "reason": "Establish what the framework is for.",
+    },
+    {
+        "target": "framework pillars",
+        "query_terms": "six pillars framework definition",
+        "reason": "Establish what the framework broadly covers.",
+    },
+    {
+        "target": "framework use and evaluation",
+        "query_terms": "architecture evaluation best practices purpose",
+        "reason": "Establish how the framework is used.",
+    },
+)
+
 CONCEPT_SECTIONS = {
     "reliability and failure preparation": "Reliability",
     "cost optimization and avoiding unnecessary spend": "Cost Optimization",
@@ -153,17 +187,63 @@ CONCEPT_LABELS = {
 
 
 def _question_concepts(question: str) -> list[str]:
-    lower = question.lower()
-    overview_patterns = (
-        r"\bwhat is (?:this|aws well[- ]architected)(?: about)?\b",
-        r"\bwhat does (?:this )?framework cover\b",
-        r"\bgive me an overview\b",
-        r"\boverview of (?:the )?(?:aws )?well[- ]architected framework\b",
-    )
-    if any(re.search(pattern, lower) for pattern in overview_patterns):
+    if is_overview_intent(question):
         return ["framework overview and purpose", "framework pillars"]
+    lower = question.lower()
     found = [name for name, terms in CONCEPTS.items() if any(term in lower for term in terms)]
     return found or [question]
+
+
+def is_overview_intent(question: str) -> bool:
+    lower = question.lower()
+    overview_patterns = (
+        r"\bwhat is (?:this|the document|the framework|aws well[- ]architected|the aws well[- ]architected framework)(?: about)?\b",
+        r"\bwhat(?:'s| is) (?:this|the document|the framework) about\b",
+        r"\bwhat is the main (?:topic|point|idea|subject) of (?:this|the document|the framework)\b",
+        r"\bwhat does (?:this |the |aws well[- ]architected |the aws well[- ]architected )?framework cover\b",
+        r"\bgive me an overview\b",
+        r"\boverview of (?:the )?(?:aws )?well[- ]architected framework\b",
+        r"\bwhat is (?:the )?aws well[- ]architected framework\b",
+    )
+    return any(re.search(pattern, lower) for pattern in overview_patterns)
+
+
+def overview_context(state: AgentState) -> dict | None:
+    if not is_overview_intent(state.original_question):
+        return None
+    supported = _normalized_items(state.assessments[-1].supported_information) if state.assessments else set()
+    missing = _normalized_items(state.assessments[-1].missing_information) if state.assessments else set()
+    previous_queries = " ".join(search.query.lower() for search in state.searches)
+    target_markers = {
+        "framework overview and purpose": ("overview", "purpose", "introduction"),
+        "framework pillars": ("pillar", "pillars"),
+        "framework use and evaluation": ("evaluation", "evaluate", "best practices"),
+    }
+    strategies = []
+    for strategy in OVERVIEW_SEARCH_STRATEGIES:
+        target = strategy["target"]
+        target_normalized = target.lower()
+        already_targeted = (
+            target_normalized in supported
+            or target_normalized in previous_queries
+            or any(marker in previous_queries for marker in target_markers[target])
+        )
+        if missing and target_normalized not in missing and target_normalized in supported:
+            already_targeted = True
+        strategies.append({**strategy, "already_targeted": already_targeted})
+    return {
+        "intent": "overview",
+        "normalized_information_need": OVERVIEW_INFORMATION_NEED,
+        "search_strategies": strategies,
+        "sufficiency_rule": (
+            "Treat overview evidence as sufficient when it establishes what the framework is for "
+            "and/or what it broadly covers, including its pillars."
+        ),
+    }
+
+
+def _normalized_items(items: list[str]) -> set[str]:
+    return {" ".join(item.lower().split()) for item in items}
 
 
 def _concept_label(concept: str) -> str:
@@ -188,6 +268,12 @@ class LocalReasoner:
         return {concept for concept in _question_concepts(state.original_question) if self._evidence_hits(state, concept)}
 
     def decide_search(self, state: AgentState) -> SearchDecision:
+        if is_overview_intent(state.original_question):
+            strategy = self._overview_strategy(state)
+            return SearchDecision(
+                search_query=f"AWS Well-Architected {strategy['query_terms']}",
+                reason=strategy["reason"],
+            )
         concepts = _question_concepts(state.original_question)
         if state.assessments and state.assessments[-1].missing_information:
             target = state.assessments[-1].missing_information[0]
@@ -203,6 +289,23 @@ class LocalReasoner:
             reason=f"Need direct framework evidence about {target}."
         )
 
+    def _overview_strategy(self, state: AgentState) -> dict:
+        previous = " ".join(search.query.lower() for search in state.searches)
+        missing = _normalized_items(state.assessments[-1].missing_information) if state.assessments else set()
+        target_markers = {
+            "framework overview and purpose": ("overview", "purpose", "introduction"),
+            "framework pillars": ("pillar", "pillars"),
+            "framework use and evaluation": ("evaluation", "evaluate", "best practices"),
+        }
+        for strategy in OVERVIEW_SEARCH_STRATEGIES:
+            target = strategy["target"].lower()
+            already_targeted = target in previous or any(marker in previous for marker in target_markers[target])
+            if missing and target not in missing and target in _normalized_items(state.assessments[-1].supported_information):
+                already_targeted = True
+            if not already_targeted:
+                return strategy
+        return OVERVIEW_SEARCH_STRATEGIES[len(state.searches) % len(OVERVIEW_SEARCH_STRATEGIES)]
+
     def assess(self, state: AgentState) -> EvidenceAssessment:
         concepts = _question_concepts(state.original_question)
         supported = sorted(self._supported(state), key=concepts.index)
@@ -213,15 +316,22 @@ class LocalReasoner:
             if any(word in gathered_text for word in re.findall(r"[a-z]+", concept))
         ]
         unsupported = [concept for concept in missing if concept not in partial]
-        enough = bool(state.gathered_evidence) and not missing
+        if is_overview_intent(state.original_question):
+            enough = bool(supported) and any(
+                concept in supported for concept in ("framework overview and purpose", "framework pillars")
+            )
+        else:
+            enough = bool(state.gathered_evidence) and not missing
         return EvidenceAssessment(
             sufficient=enough,
             reason=(
                 f"Supported: {', '.join(supported)}."
                 if enough else f"Supported: {', '.join(supported) or 'none'}. Still missing: {', '.join(missing)}."
             ),
-            missing_information=missing,
-            suggested_next_search=f"AWS Well-Architected {CONCEPT_SEARCH_TERMS.get(missing[0], missing[0])}" if missing else None,
+            missing_information=[] if enough else missing,
+            suggested_next_search=(
+                None if enough or not missing else f"AWS Well-Architected {CONCEPT_SEARCH_TERMS.get(missing[0], missing[0])}"
+            ),
             supported_information=supported,
             partially_supported_information=partial,
             unsupported_information=unsupported,

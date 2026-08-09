@@ -129,6 +129,35 @@ def test_vague_question_triggers_overview_search_and_cited_answer():
     assert trace.citation_validation.valid is True
 
 
+def test_standard_overview_questions_do_not_dead_end_on_duplicate_strategy():
+    questions = [
+        "what is this about?",
+        "what is the main topic of this?",
+        "what does the AWS Well-Architected Framework cover?",
+    ]
+    for question in questions:
+        retriever = OverviewRetriever()
+        _, trace = Agent(retriever, LocalReasoner(), max_iterations=4).run(question)
+        first_query = trace.iterations[0].search_decision.search_query.lower()
+        assert trace.stop_reason == "sufficient_evidence"
+        assert trace.stop_reason != "no_new_search_strategy"
+        assert trace.citation_validation.valid is True
+        assert "[AWS-WAF p." in trace.final_answer
+        assert "what is the main topic" not in first_query
+        assert "what is this about" not in first_query
+        assert "framework cover" not in first_query
+
+
+def test_overview_retry_changes_information_target_after_partial_evidence():
+    retriever = OverviewNeedsSecondStrategyRetriever()
+    _, trace = Agent(retriever, LocalReasoner(), max_iterations=4).run("what is the main topic of this?")
+    assert retriever.queries[0].lower() != retriever.queries[1].lower()
+    assert "overview" in retriever.queries[0].lower() or "purpose" in retriever.queries[0].lower()
+    assert "pillar" in retriever.queries[1].lower()
+    assert trace.stop_reason == "sufficient_evidence"
+    assert trace.citation_validation.valid is True
+
+
 def test_status_only_fallback_does_not_require_a_citation():
     answer = "The evidence remained incomplete at the iteration limit, so no broader conclusion is asserted."
     _, validation = Agent.validate_citations(answer, [])
@@ -253,4 +282,29 @@ class OverviewRetriever:
                 "security, reliability, performance efficiency, cost optimization, and sustainability."
             ),
             score=0.9,
+        )]
+
+
+class OverviewNeedsSecondStrategyRetriever:
+    def __init__(self):
+        self.queries = []
+
+    def search(self, query, k=6):
+        self.queries.append(query)
+        if "pillar" in query.lower():
+            return [EvidenceChunk(
+                chunk_id="pillars",
+                page=9,
+                text=(
+                    "The AWS Well-Architected Framework is based on six pillars: operational "
+                    "excellence, security, reliability, performance efficiency, cost optimization, "
+                    "and sustainability."
+                ),
+                score=0.9,
+            )]
+        return [EvidenceChunk(
+            chunk_id="toc",
+            page=2,
+            text="Resources and related documents for AWS architecture guidance.",
+            score=0.4,
         )]
