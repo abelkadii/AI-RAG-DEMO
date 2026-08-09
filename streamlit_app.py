@@ -50,55 +50,255 @@ def run_agent(question: str) -> AgentTrace:
     return trace
 
 
+def apply_styles() -> None:
+    st.markdown(
+        """
+        <style>
+        :root {
+            --aws-orange: #ff9900;
+            --ink: #f5f7fb;
+            --muted: #9aa4b2;
+            --panel: rgba(22, 27, 34, 0.82);
+            --panel-strong: rgba(31, 38, 50, 0.96);
+            --line: rgba(255, 255, 255, 0.12);
+            --green: #45d483;
+            --cyan: #55d7ff;
+            --amber: #ffbf4c;
+        }
+        .stApp {
+            background:
+                radial-gradient(circle at 18% 0%, rgba(255,153,0,0.15), transparent 28%),
+                radial-gradient(circle at 88% 12%, rgba(85,215,255,0.10), transparent 30%),
+                linear-gradient(135deg, #090c10 0%, #101722 45%, #0b0f16 100%);
+        }
+        .block-container {
+            max-width: 1180px;
+            padding-top: 2rem;
+        }
+        .hero {
+            border: 1px solid var(--line);
+            border-radius: 18px;
+            padding: 28px 30px;
+            background: linear-gradient(145deg, rgba(24,31,42,0.94), rgba(11,15,22,0.86));
+            box-shadow: 0 24px 70px rgba(0,0,0,0.28);
+            margin-bottom: 22px;
+        }
+        .eyebrow {
+            color: var(--aws-orange);
+            font-size: 0.78rem;
+            letter-spacing: .08em;
+            text-transform: uppercase;
+            font-weight: 700;
+        }
+        .hero h1 {
+            margin: 8px 0 8px 0;
+            font-size: clamp(2rem, 4vw, 3.2rem);
+            line-height: 1.05;
+        }
+        .hero p {
+            color: var(--muted);
+            font-size: 1.04rem;
+            margin: 0;
+        }
+        .flow {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 20px;
+        }
+        .flow span {
+            border: 1px solid rgba(255,153,0,0.22);
+            background: rgba(255,153,0,0.08);
+            color: #ffe3b1;
+            border-radius: 999px;
+            padding: 7px 11px;
+            font-size: .88rem;
+        }
+        .metric-row {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 12px;
+            margin: 12px 0 24px;
+        }
+        .metric {
+            border: 1px solid var(--line);
+            border-radius: 14px;
+            padding: 14px 16px;
+            background: var(--panel);
+        }
+        .metric .label { color: var(--muted); font-size: .78rem; }
+        .metric .value { color: var(--ink); font-size: 1.3rem; font-weight: 800; margin-top: 4px; }
+        .iteration-card, .final-card {
+            border: 1px solid var(--line);
+            border-radius: 18px;
+            background: var(--panel);
+            padding: 20px;
+            margin: 18px 0;
+        }
+        .iteration-title {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 14px;
+        }
+        .iteration-title h3 {
+            margin: 0;
+            color: var(--ink);
+        }
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            border-radius: 999px;
+            padding: 6px 11px;
+            font-size: .78rem;
+            font-weight: 800;
+            letter-spacing: .02em;
+            border: 1px solid var(--line);
+        }
+        .badge.good { color: #d6ffe6; background: rgba(69,212,131,.16); border-color: rgba(69,212,131,.36); }
+        .badge.warn { color: #fff0cc; background: rgba(255,191,76,.16); border-color: rgba(255,191,76,.36); }
+        .section-label {
+            color: var(--muted);
+            text-transform: uppercase;
+            font-size: .75rem;
+            letter-spacing: .08em;
+            font-weight: 800;
+            margin: 10px 0 5px;
+        }
+        .evidence-pill {
+            display: inline-block;
+            margin: 4px 6px 4px 0;
+            border-radius: 999px;
+            border: 1px solid rgba(85,215,255,.28);
+            background: rgba(85,215,255,.08);
+            color: #dff8ff;
+            padding: 6px 10px;
+            font-size: .88rem;
+        }
+        .coverage {
+            border: 1px solid var(--line);
+            border-radius: 13px;
+            padding: 12px;
+            min-height: 118px;
+            background: rgba(255,255,255,.035);
+        }
+        .coverage ul {
+            margin-bottom: 0;
+            padding-left: 1.05rem;
+        }
+        .final-card {
+            background: linear-gradient(145deg, rgba(24,36,30,.92), rgba(13,18,25,.92));
+            border-color: rgba(69,212,131,.28);
+        }
+        div[data-testid="stCodeBlock"] pre {
+            border-radius: 12px;
+            border: 1px solid var(--line);
+        }
+        .stButton > button {
+            border-radius: 12px;
+            min-height: 44px;
+            font-weight: 800;
+        }
+        @media (max-width: 900px) {
+            .metric-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_hero() -> None:
+    st.markdown(
+        """
+        <div class="hero">
+          <div class="eyebrow">Milestone 1 Live Demo</div>
+          <h1>AWS Well-Architected - Agentic RAG Demo</h1>
+          <p>Evidence-driven iterative retrieval with full trajectory tracing.</p>
+          <div class="flow">
+            <span>Search</span><span>Retrieve</span><span>Assess</span>
+            <span>Refine if needed</span><span>Stop when supported</span><span>Cite</span>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_metrics(trace: AgentTrace) -> None:
+    valid = "Valid" if trace.citation_validation.valid else "Needs review"
+    st.markdown(
+        f"""
+        <div class="metric-row">
+          <div class="metric"><div class="label">Iterations</div><div class="value">{trace.total_iterations}</div></div>
+          <div class="metric"><div class="label">Unique evidence chunks</div><div class="value">{trace.total_unique_evidence_chunks}</div></div>
+          <div class="metric"><div class="label">Stop reason</div><div class="value">{trace.stop_reason or "unknown"}</div></div>
+          <div class="metric"><div class="label">Citations</div><div class="value">{valid}</div></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def render_iteration(item: IterationTrace) -> None:
     assessment = item.assessment
     state = "SUFFICIENT" if assessment.sufficient else "INSUFFICIENT"
-    st.subheader(f"ITERATION {item.iteration}")
+    badge_class = "good" if assessment.sufficient else "warn"
+    st.markdown('<div class="iteration-card">', unsafe_allow_html=True)
+    st.markdown(
+        f"""
+        <div class="iteration-title">
+          <h3>Iteration {item.iteration}</h3>
+          <span class="badge {badge_class}">{state}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    left, right = st.columns([2, 1])
+    left, right = st.columns([1.4, 1])
     with left:
-        st.markdown("**Search**")
+        st.markdown('<div class="section-label">Search</div>', unsafe_allow_html=True)
         st.code(item.search_decision.search_query, language=None)
-        st.markdown("**Reason**")
+        st.markdown('<div class="section-label">Reason</div>', unsafe_allow_html=True)
         st.write(item.search_decision.reason)
     with right:
-        if assessment.sufficient:
-            st.success(state)
-        else:
-            st.warning(state)
+        st.markdown('<div class="section-label">Evidence pages</div>', unsafe_allow_html=True)
+        pills = "\n".join(
+            f'<span class="evidence-pill">{section} - AWS-WAF p.{page}</span>'
+            for section, page in evidence_pages(item)
+        )
+        st.markdown(pills or "No evidence retrieved", unsafe_allow_html=True)
 
-    st.markdown("**Evidence**")
-    for section, page in evidence_pages(item):
-        st.write(f"- {section} - AWS-WAF p.{page}")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        render_coverage("Supported", assessment.supported_information, "+")
+    with c2:
+        render_coverage("Partially supported", assessment.partially_supported_information, "~")
+    with c3:
+        render_coverage("Missing", assessment.missing_information, "-")
+
+    if assessment.suggested_next_search:
+        st.markdown('<div class="section-label">Next search</div>', unsafe_allow_html=True)
+        st.code(assessment.suggested_next_search, language=None)
 
     with st.expander("Full retrieved evidence"):
         for chunk in item.retrieved:
             st.markdown(f"**{chunk.section or 'Unknown'} - AWS-WAF p.{chunk.page}**")
             st.caption(f"score: {chunk.score}")
             st.write(chunk.text_preview)
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.markdown("**Supported**")
-        render_list(assessment.supported_information, "+")
-    with c2:
-        st.markdown("**Partially supported**")
-        render_list(assessment.partially_supported_information, "~")
-    with c3:
-        st.markdown("**Missing**")
-        render_list(assessment.missing_information, "-")
-
-    if assessment.suggested_next_search:
-        st.markdown("**Next search**")
-        st.code(assessment.suggested_next_search, language=None)
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
-def render_list(items: list[str], marker: str) -> None:
+def render_coverage(title: str, items: list[str], marker: str) -> None:
+    st.markdown('<div class="coverage">', unsafe_allow_html=True)
+    st.markdown(f"**{title}**")
     if not items:
         st.caption("None")
-        return
-    for item in items:
-        st.write(f"{marker} {short_label(item)}")
+    else:
+        for item in items:
+            st.write(f"{marker} {short_label(item)}")
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def evidence_pages(item: IterationTrace) -> list[tuple[str, int]]:
@@ -123,7 +323,8 @@ def short_label(text: str) -> str:
 
 
 def render_final(trace: AgentTrace) -> None:
-    st.header("FINAL ANSWER")
+    st.markdown('<div class="final-card">', unsafe_allow_html=True)
+    st.header("Final Answer")
     st.markdown(trace.final_answer or "")
 
     validation = trace.citation_validation
@@ -135,6 +336,7 @@ def render_final(trace: AgentTrace) -> None:
 
     st.markdown("**Stop reason**")
     st.code(trace.stop_reason or "unknown", language=None)
+    st.markdown("</div>", unsafe_allow_html=True)
 
     trace_json = trace.model_dump_json(indent=2, by_alias=True)
     with st.expander("View full trace"):
@@ -148,25 +350,25 @@ def render_final(trace: AgentTrace) -> None:
 
 
 def main() -> None:
-    configure_credentials()
     st.set_page_config(
         page_title="AWS Well-Architected - Agentic RAG Demo",
-        page_icon="🔎",
+        page_icon="AWS",
         layout="wide",
     )
+    configure_credentials()
+    apply_styles()
+    render_hero()
 
-    st.title("AWS Well-Architected — Agentic RAG Demo")
-    st.caption("Evidence-driven iterative retrieval with full trajectory tracing.")
-    st.markdown("Search -> Retrieve -> Assess -> Refine if needed -> Stop when supported -> Cite")
+    with st.container(border=True):
+        question = st.text_area(
+            "Ask a question about the AWS Well-Architected Framework",
+            value=DEFAULT_QUESTION,
+            max_chars=MAX_QUESTION_LENGTH,
+            height=118,
+        )
+        run = st.button("Run agent", type="primary", use_container_width=True)
 
-    question = st.text_area(
-        "Ask a question about the AWS Well-Architected Framework",
-        value=DEFAULT_QUESTION,
-        max_chars=MAX_QUESTION_LENGTH,
-        height=120,
-    )
-
-    if st.button("Run agent", type="primary"):
+    if run:
         cleaned = question.strip()
         if not cleaned:
             st.error("Please enter a question.")
@@ -182,9 +384,9 @@ def main() -> None:
                 st.error(f"Agent run failed: {error}")
                 return
 
+        render_metrics(trace)
         for item in trace.iterations:
             render_iteration(item)
-            st.divider()
         render_final(trace)
 
 
