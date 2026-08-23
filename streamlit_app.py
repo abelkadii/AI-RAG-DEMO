@@ -16,8 +16,8 @@ from document_workflow import DEFAULT_BRIEF, DEPTH_PROFILES, DocumentWorkflow, e
 from llm import configured_reasoner
 from models import AgentTrace, EvidenceChunk, IterationTrace
 from retriever import Retriever
-from uploaded_corpus import MAX_UPLOAD_BYTES, MAX_UPLOAD_FILES, UploadedPDF, UploadedRetriever, build_uploaded_retriever, corpus_hash
-from website_context import fetch_website_evidence
+from uploaded_corpus import MAX_UPLOAD_BYTES, MAX_UPLOAD_FILES, EmptyRetriever, UploadedPDF, UploadedRetriever, build_uploaded_retriever, corpus_hash
+from website_context import MAX_WEBSITE_PAGES, fetch_website_evidence
 
 
 DEFAULT_QUESTION = (
@@ -363,7 +363,7 @@ def document_studio() -> None:
             default_title = (
                 "AWS Well-Architected Architecture Assessment & Remediation Plan"
                 if source_choice == "Built-in AWS sample"
-                else "Concise Source Summary"
+                else "Evidence-Grounded Report"
             )
             title = st.text_input(
                 "Report title",
@@ -461,28 +461,25 @@ def document_studio() -> None:
                 uploaded = [UploadedPDF(name=name, content=content) for name, content in payload]
                 client_retriever = cached_uploaded_retriever(corpus_hash(uploaded), payload)
                 client_chunks.extend(client_retriever.chunks)
-            client_chunks.append(EvidenceChunk(
-                chunk_id="client-brief-p001-c00",
-                page=1,
-                section="Client brief",
-                source="Client Brief",
-                text=brief.strip(),
-                score=1.0,
-            ))
             website_notice = None
+            website_report = None
+            website_chunks = []
             if website_url.strip():
-                website_chunks, website_notice = fetch_website_evidence(website_url.strip(), max_pages=3)
+                website_chunks, website_notice, website_report = fetch_website_evidence(
+                    website_url.strip(), max_pages=MAX_WEBSITE_PAGES, return_report=True
+                )
                 client_chunks.extend(website_chunks)
-            retriever = UploadedRetriever(client_chunks)
-            source_names = ", ".join(client_names) if client_names else "Client brief"
+            retriever = UploadedRetriever(client_chunks) if client_chunks else EmptyRetriever()
+            source_names = ", ".join(client_names) if client_names else ("Website evidence" if website_chunks else "Client requirements")
             source_kind = "uploaded"
-            knowledge_base = f"Client evidence: {source_names}"
+            knowledge_base = f"Client evidence: {source_names}" if client_chunks else "Client requirements only"
         else:
             retriever = shared_retriever()
             reference_retriever = None
             reference_names = []
             client_names = []
             website_notice = None
+            website_report = None
             source_kind = "aws_sample"
             knowledge_base = "AWS Well-Architected Framework"
         spec = DocumentSpec(
@@ -508,6 +505,20 @@ def document_studio() -> None:
         ]
         if website_notice:
             events.append(website_notice)
+        if source_kind == "uploaded" and website_report:
+            events.append(
+                f"Website resolved: {website_report.resolved_url or 'unresolved'} "
+                f"(HTTP {website_report.status_code or 'n/a'}); "
+                f"indexed characters: {sum(website_report.character_counts.values()):,}"
+            )
+            events.append(
+                f"Website pages: {len(website_report.pages_discovered)} discovered, "
+                f"{len(website_report.pages_fetched)} fetched, "
+                f"{len(website_report.indexed_pages)} indexed, "
+                f"{len(website_report.pages_rejected)} rejected"
+            )
+            if website_report.pages_rejected:
+                events.append("Website rejected: " + "; ".join(website_report.pages_rejected[:3]))
         feed_placeholder.markdown(render_terminal(events), unsafe_allow_html=True)
 
         def on_feed(message: str) -> None:

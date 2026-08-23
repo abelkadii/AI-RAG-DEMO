@@ -67,6 +67,18 @@ class Agent:
                 "**Company Website:**",
             )):
                 continue
+            if stripped.startswith((
+                "Scope.",
+                "Analysis focus.",
+                "Current evidence status.",
+                "Evidence status.",
+                "Working hypothesis.",
+                "Data required.",
+                "External research limitation.",
+                "External research status.",
+                "Recommended next step.",
+            )):
+                continue
             is_heading = stripped.endswith(":") or len(stripped.split()) <= 4 and not stripped.endswith((".", "]"))
             if is_heading:
                 continue

@@ -35,6 +35,15 @@ class UploadedRetriever:
         return diversify_results(candidates, k=k)
 
 
+class EmptyRetriever:
+    """Requirements-only mode when no client PDFs or website evidence exist."""
+
+    chunks: list[EvidenceChunk] = []
+
+    def search(self, query: str, k: int = 6) -> list[EvidenceChunk]:
+        return []
+
+
 def corpus_hash(files: list[UploadedPDF]) -> str:
     digest = hashlib.sha256()
     for item in sorted(files, key=lambda file: file.name.lower()):

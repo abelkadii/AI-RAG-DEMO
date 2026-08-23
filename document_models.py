@@ -116,6 +116,7 @@ class DocumentQC(BaseModel):
     missing_scope_requirements: list[str] = Field(default_factory=list)
     scope_coverage: dict[str, str] = Field(default_factory=dict)
     reference_leakage: list[str] = Field(default_factory=list)
+    requirements_as_evidence: list[str] = Field(default_factory=list)
 
 
 class DocumentTrace(BaseModel):
