@@ -14,7 +14,10 @@ class DocumentSpec(BaseModel):
     title: str = "AWS Well-Architected Architecture Assessment & Remediation Plan"
     client_brief: str
     audience: str = "Executive and technical stakeholders"
-    target_depth: Literal["Demo", "Detailed"] = "Demo"
+    # ``Demo`` is retained as a compatibility value for older traces and API
+    # callers.  The public UI exposes the four production depth profiles.
+    target_depth: Literal["Brief", "Standard", "Detailed", "Comprehensive", "Demo"] = "Standard"
+    target_word_count: int | None = Field(default=None, ge=100, le=10000)
     knowledge_base: str = "AWS Well-Architected Framework"
     source_kind: Literal["aws_sample", "uploaded"] = "aws_sample"
     deliverable_type: Literal[
@@ -31,13 +34,25 @@ class DocumentSectionPlan(BaseModel):
     section_id: str
     title: str
     objective: str
-    research_question: str
+    research_question: str = ""
+    research_questions: list[str] = Field(default_factory=list)
+    approximate_word_budget: int | None = Field(default=None, ge=25)
+    requirements: list[str] = Field(default_factory=list)
+
+    @property
+    def questions(self) -> list[str]:
+        """Return the normalized research-question list for old/new traces."""
+        return self.research_questions or ([self.research_question] if self.research_question else [])
 
 
 class DocumentPlan(BaseModel):
     title: str
     sections: list[DocumentSectionPlan]
     deliverable_type: str = "Consulting Assessment"
+    target_depth: str = "Standard"
+    target_word_count: int | None = None
+    source_survey: list[EvidenceChunk] = Field(default_factory=list)
+    source_topics: list[str] = Field(default_factory=list)
 
 
 class SectionQC(BaseModel):
@@ -70,6 +85,13 @@ class DocumentQC(BaseModel):
     major_issues: list[str] = Field(default_factory=list)
     recommendations_align_with_findings: bool = True
     summary: str = ""
+    target_word_count: int | None = None
+    final_word_count: int = 0
+    unique_pages_researched: int = 0
+    unique_pages_cited: int = 0
+    cross_section_duplication: list[str] = Field(default_factory=list)
+    contradictions: list[str] = Field(default_factory=list)
+    unsupported_recommendations: list[str] = Field(default_factory=list)
 
 
 class DocumentTrace(BaseModel):
@@ -84,3 +106,7 @@ class DocumentTrace(BaseModel):
     duration_ms: int | None = None
     total_research_iterations: int = 0
     total_unique_evidence_pages: int = 0
+    total_retrieved_evidence_chunks: int = 0
+    total_unique_cited_pages: int = 0
+    final_word_count: int = 0
+    target_word_count: int | None = None

@@ -21,12 +21,14 @@ Source Knowledge + Client Brief
 
 The default Streamlit experience is **Document Studio**, which can generate either an AWS Well-Architected assessment from the built-in sample corpus or a generic evidence-grounded report from uploaded PDFs. It includes:
 
-- editable report title, brief, audience, and target depth;
+- editable report title, brief, audience, deliverable type, and target depth;
+- independent depth profiles: Brief (500–800 words), Standard (1,200–2,000), Detailed (2,500–4,000), and Comprehensive (4,000–7,000);
+- explicit brief word counts take precedence over the selected depth;
 - a source selector for the built-in AWS sample or uploaded PDF documents;
-- section-level research traces;
+- source surveying followed by section-level, multi-question research traces;
 - source/page cited report sections, such as `[AWS Well-Architected Framework p.303]` or `[Strategy_Report.pdf p.12]`;
 - automated section QC and document QC;
-- downloads for DOCX, Markdown, and JSON trace.
+- downloads for DOCX, PDF, Markdown, and JSON trace.
 
 Uploaded PDFs are parsed page-by-page, chunked, indexed in memory, and cached by content hash for Streamlit reruns. Uploaded client documents are not committed to the repository and are not intended to become a persistent document library.
 
@@ -53,8 +55,8 @@ Every run records search queries, reasons, retrieved page/section metadata, suff
 - `agent.py`: runs the explicit search -> retrieve -> assess -> refine -> stop loop.
 - `llm.py`: OpenAI-compatible reasoning path with bounded structured-output retry and an offline deterministic fallback.
 - `document_models.py`: serializable document-production trace models.
-- `document_workflow.py`: plans reports, researches each section with the existing agent loop, drafts cited sections, and runs QC.
-- `document_export.py`: exports DOCX and Markdown.
+- `document_workflow.py`: surveys sources, builds depth-aware plans, researches each section with distinct questions, drafts cited sections, and runs QC.
+- `document_export.py`: exports DOCX, PDF, and Markdown.
 - `streamlit_app.py`: public demo UI with Document Studio and RAG Explorer tabs.
 
 ## Local Setup
@@ -95,10 +97,10 @@ Credentials stay server-side and are never written to traces or UI output.
 Document Studio provides:
 
 - DOCX report export;
+- PDF report export rendered directly with PyMuPDF;
 - Markdown report export;
 - complete JSON execution trace.
 
-PDF export is intentionally not included because Streamlit Community Cloud does not guarantee LibreOffice or other OS-level converters.
 
 ## Testing
 

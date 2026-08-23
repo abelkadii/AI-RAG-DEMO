@@ -1,4 +1,4 @@
-from document_export import docx_bytes, markdown_bytes
+from document_export import docx_bytes, markdown_bytes, pdf_bytes
 from document_models import DocumentSpec, SectionQC
 from document_workflow import (
     DEFAULT_BRIEF,
@@ -6,6 +6,9 @@ from document_workflow import (
     citation_coverage_issues,
     resolve_deliverable_type,
     serializable_evidence,
+    DEPTH_PROFILES,
+    explicit_word_count,
+    target_word_count,
 )
 from llm import LocalReasoner
 from models import EvidenceChunk
@@ -241,6 +244,55 @@ def test_references_are_built_from_citations_used_in_report():
     references = trace.final_markdown.split("## Evidence / References", 1)[1]
     assert "[AWS-WAF p." in references or "[AWS Well-Architected Framework p." in references
     assert trace.citation_validation.cited_references
+
+
+def test_depth_profiles_and_explicit_word_count_are_independent_from_deliverable_type():
+    spec = DocumentSpec(
+        client_brief="Create a detailed 3,000-word study guide.",
+        source_kind="uploaded",
+        deliverable_type="Curriculum / Teaching Material",
+        target_depth="Brief",
+    )
+    assert DEPTH_PROFILES["Detailed"][0] == 3000
+    assert explicit_word_count(spec.client_brief) == 3000
+    assert target_word_count(spec) == 3000
+
+
+def test_detailed_curriculum_plan_has_meaningful_sections_and_research_questions():
+    spec = DocumentSpec(
+        client_brief="Create a detailed 3,000-word study guide explaining the major topics and provide a final revision checklist.",
+        source_kind="uploaded",
+        deliverable_type="Curriculum / Teaching Material",
+        target_depth="Detailed",
+    )
+    plan = make_workflow().plan(spec, [])
+    content_sections = [section for section in plan.sections if section.section_id != "evidence"]
+    assert len(content_sections) >= 6
+    assert all(len(section.questions) >= 2 for section in content_sections)
+    assert sum(section.approximate_word_budget or 0 for section in content_sections) == 3000
+
+
+def test_detailed_uploaded_workflow_hits_requested_scale_and_tracks_metrics():
+    spec = DocumentSpec(
+        title="Course Study Guide",
+        client_brief="Create a detailed 3,000-word study guide explaining the major mathematical topics covered by this course. Provide a final revision checklist.",
+        source_kind="uploaded",
+        deliverable_type="Curriculum / Teaching Material",
+        target_depth="Detailed",
+    )
+    trace = make_workflow().run(spec)
+    assert 2550 <= trace.final_word_count <= 3450
+    assert trace.final_qc.passed
+    assert trace.total_retrieved_evidence_chunks >= trace.total_unique_cited_pages
+    assert trace.total_unique_cited_pages >= 1
+    assert "Final Revision Checklist" in trace.final_markdown
+
+
+def test_pdf_export_is_a_valid_nonempty_pdf():
+    trace = make_workflow().run(make_spec())
+    output = pdf_bytes(trace)
+    assert output.startswith(b"%PDF-")
+    assert len(output) > 1000
 
 
 class FailsOnceQC:

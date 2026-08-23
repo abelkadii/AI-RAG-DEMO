@@ -10,9 +10,9 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from agent import Agent
-from document_export import docx_bytes, markdown_bytes
+from document_export import docx_bytes, markdown_bytes, pdf_bytes
 from document_models import DocumentSpec, DocumentTrace
-from document_workflow import DEFAULT_BRIEF, DocumentWorkflow
+from document_workflow import DEFAULT_BRIEF, DEPTH_PROFILES, DocumentWorkflow, explicit_word_count
 from llm import configured_reasoner
 from models import AgentTrace, IterationTrace
 from retriever import Retriever
@@ -69,7 +69,13 @@ def run_document(spec: DocumentSpec, retriever, status_box=None) -> DocumentTrac
             status_box(message)
 
     workflow = DocumentWorkflow(retriever, configured_reasoner())
-    return workflow.run(spec, on_event)
+    trace = workflow.run(spec, on_event)
+    on_event("Rendering DOCX/PDF")
+    # Render once during the run so the demo proves the deliverable is
+    # downloadable, while the bytes remain generated on demand below.
+    docx_bytes(trace)
+    pdf_bytes(trace)
+    return trace
 
 
 @st.cache_resource(show_spinner=False)
@@ -290,7 +296,7 @@ def render_terminal(events: list[str], *, state: str = "running") -> str:
 def document_studio() -> None:
     hero(
         "AI Document Studio",
-        "Upload PDFs or use the AWS sample, then turn source knowledge and a client brief into a researched, reviewed, cited consulting deliverable.",
+        "Upload PDFs or use the AWS sample, then turn source knowledge and a client brief into a researched, reviewed, cited deliverable.",
         ["Sources", "Requirements", "Plan", "Research", "Draft", "Review", "Deliver"],
         "Evidence-grounded document production",
     )
@@ -383,7 +389,18 @@ def document_studio() -> None:
                     max_chars=MAX_AUDIENCE_LENGTH,
                 )
             with c2:
-                target_depth = st.selectbox("Target depth", ["Demo", "Detailed"], index=0)
+                target_depth = st.selectbox(
+                    "Target depth",
+                    ["Brief", "Standard", "Detailed", "Comprehensive"],
+                    index=1,
+                    help="Depth controls length independently of deliverable type.",
+                )
+            requested_words = explicit_word_count(brief)
+            if requested_words:
+                st.caption(f"Explicit request detected: approximately {requested_words:,} words (overrides depth).")
+            else:
+                low, high = DEPTH_PROFILES[target_depth][1]
+                st.caption(f"Expected length: approximately {low:,}–{high:,} words (references excluded).")
             access_ok = require_access_code()
             run = st.button("Generate report from selected source", type="primary", use_container_width=True, disabled=not access_ok)
 
@@ -428,6 +445,7 @@ def document_studio() -> None:
             knowledge_base=knowledge_base,
             source_kind=source_kind,
             deliverable_type=deliverable_type,
+            target_word_count=requested_words,
         )
         events = [
             f"Selected source: {knowledge_base}",
@@ -464,9 +482,12 @@ def render_document_results(trace: DocumentTrace) -> None:
     status = "Passed" if trace.final_qc.passed else "Needs review"
     metric_row(
         [
-            ("Sections generated", str(len(trace.sections))),
-            ("Evidence pages", str(len(pages))),
             ("Research iterations", str(trace.total_research_iterations)),
+            ("Evidence chunks retrieved", str(trace.total_retrieved_evidence_chunks)),
+            ("Unique pages researched", str(len(pages))),
+            ("Unique pages cited", str(trace.total_unique_cited_pages)),
+            ("Final word count", f"{trace.final_word_count:,}"),
+            ("Target word count", f"{trace.target_word_count:,}" if trace.target_word_count else "—"),
             ("Sections passing QC", str(sections_passing)),
             ("Final review", status),
         ]
@@ -509,7 +530,8 @@ def render_document_results(trace: DocumentTrace) -> None:
                 st.write(f"Section QC: {'passed' if section.qc.passed else 'needs review'}")
     with downloads:
         trace_json = trace.model_dump_json(indent=2, by_alias=True)
-        st.download_button("Download DOCX", docx_bytes(trace), "aws-architecture-assessment.docx")
+        st.download_button("Download DOCX", docx_bytes(trace), "evidence-grounded-report.docx")
+        st.download_button("Download PDF", pdf_bytes(trace), "evidence-grounded-report.pdf", mime="application/pdf")
         st.download_button("Download Markdown", markdown_bytes(trace), "aws-architecture-assessment.md", mime="text/markdown")
         st.download_button("Download JSON trace", trace_json, "document_trace.json", mime="application/json")
         with st.expander("View full document trace"):

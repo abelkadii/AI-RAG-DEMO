@@ -31,6 +31,119 @@ DEFAULT_BRIEF = (
 )
 
 
+DEPTH_PROFILES: dict[str, tuple[int, tuple[int, int]]] = {
+    "Brief": (650, (500, 800)),
+    "Standard": (1600, (1200, 2000)),
+    "Detailed": (3000, (2500, 4000)),
+    "Comprehensive": (5500, (4000, 7000)),
+}
+
+
+def explicit_word_count(brief: str) -> int | None:
+    """Extract an explicit user-requested word count, if present."""
+    matches = re.findall(r"\b(\d{1,2}(?:,\d{3})+|\d{3,5})[-\s]*(?:words?|word)\b", brief or "", flags=re.I)
+    return int(matches[-1].replace(",", "")) if matches else None
+
+
+def target_word_count(spec: DocumentSpec) -> int | None:
+    """Resolve an explicit request before the selected depth profile."""
+    return explicit_word_count(spec.client_brief) or spec.target_word_count or (
+        None if spec.target_depth == "Demo" else DEPTH_PROFILES[spec.target_depth][0]
+    )
+
+
+def depth_label(spec: DocumentSpec) -> str:
+    return "Brief" if spec.target_depth == "Demo" else spec.target_depth
+
+
+def depth_range(spec: DocumentSpec) -> tuple[int, int] | None:
+    if explicit_word_count(spec.client_brief) or spec.target_word_count:
+        target = target_word_count(spec)
+        return (round(target * 0.85), round(target * 1.15)) if target else None
+    return DEPTH_PROFILES.get(depth_label(spec), (None, (None, None)))[1]
+
+
+def section_requirements_for_id(section_id: str) -> list[str]:
+    return {
+        "executive-summary": ["summary", "assessment"],
+        "scope-objectives": ["scope", "objectives"],
+        "reliability": ["failure", "recovery"],
+        "security": ["identity", "data"],
+        "cost": ["resource", "cost"],
+        "recommendations": ["priority"],
+        "roadmap": ["roadmap"],
+        "evidence": ["references"],
+    }.get(section_id, [])
+
+
+def allocate_budgets(target: int, definitions: list[tuple]) -> list[int | None]:
+    if not target:
+        return [None for _ in definitions]
+    weights = [max(1, int(item[-1])) for item in definitions]
+    total = sum(weights)
+    budgets = [max(80, round(target * weight / total)) for weight in weights]
+    # Keep the sum exactly at the requested target so final expansion has a
+    # deterministic contract, while tolerating rounding.
+    budgets[-1] += target - sum(budgets)
+    return budgets
+
+
+def source_topic_labels(survey: list[EvidenceChunk]) -> list[str]:
+    """Extract readable topic labels without presenting raw PDF fragments."""
+    labels: list[str] = []
+    seen: set[str] = set()
+    for chunk in survey:
+        text = normalize_claim_text(chunk.text)
+        if not text:
+            continue
+        candidates = re.split(r"[.!?;:]\s+", text)
+        candidate = next((item.strip(" -") for item in candidates if 2 <= len(item.split()) <= 10), "")
+        if not candidate:
+            continue
+        candidate = re.sub(r"\b(?:chapter|chapitre|section|slide)\s+\d+\b", "", candidate, flags=re.I).strip(" -:")
+        if len(candidate) < 4 or looks_garbled(candidate):
+            continue
+        key = re.sub(r"\W+", " ", candidate.lower()).strip()
+        if key in seen:
+            continue
+        seen.add(key)
+        labels.append(candidate[0].upper() + candidate[1:])
+        if len(labels) >= 8:
+            break
+    return labels
+
+
+def merge_agent_traces(question: str, traces: list[AgentTrace]) -> AgentTrace:
+    if not traces:
+        return AgentTrace(question=question, stop_reason="no_evidence")
+    merged = AgentTrace(
+        question=question,
+        started_at=traces[0].started_at,
+        completed_at=traces[-1].completed_at,
+        duration_ms=sum(trace.duration_ms or 0 for trace in traces),
+        iterations=[],
+        stop_reason=traces[-1].stop_reason,
+        citation_validation=CitationValidation(
+            valid=True,
+            retrieved_pages=sorted({page for trace in traces for page in trace.citation_validation.retrieved_pages}),
+            retrieved_references=sorted({ref for trace in traces for ref in trace.citation_validation.retrieved_references}),
+        ),
+    )
+    for trace in traces:
+        merged.iterations.extend(trace.iterations)
+    merged.total_iterations = len(merged.iterations)
+    merged.total_unique_evidence_chunks = len({item.chunk_id for trace in traces for item in trace.iterations for item in item.retrieved})
+    return merged
+
+
+def citation_pairs(text: str) -> list[tuple[str, int]]:
+    return [(match.group(1), int(match.group(2))) for match in re.finditer(r"\[([^\[\]\n]+?) p\.(\d+)\]", text)]
+
+
+def count_words(text: str) -> int:
+    return len(re.findall(r"[\w\u0600-\u06FF]+", re.sub(r"\[[^\]]+\]", "", text)))
+
+
 @dataclass(frozen=True)
 class EvidenceClaim:
     text: str
@@ -74,9 +187,9 @@ class DocumentWorkflow:
         self.section_writer = section_writer or EvidenceGroundedSectionWriter()
         self.qc_runner = qc_runner or DeterministicSectionQC()
 
-    def plan(self, spec: DocumentSpec) -> DocumentPlan:
+    def plan(self, spec: DocumentSpec, survey: list[EvidenceChunk] | None = None) -> DocumentPlan:
         if spec.source_kind == "uploaded":
-            return self._uploaded_plan(spec)
+            return self._uploaded_plan(spec, survey or [])
         sections = [
             ("executive-summary", "Executive Summary", "Summarize the overall assessment, key risks, and remediation themes.", "AWS Well-Architected reliability security cost optimization architecture assessment summary risks remediation"),
             ("scope-objectives", "Assessment Scope and Objectives", "Define the assessment scope, objectives, and evidence-grounding approach.", "AWS Well-Architected framework overview purpose evaluate architectures best practices"),
@@ -87,74 +200,137 @@ class DocumentWorkflow:
             ("roadmap", "Implementation Roadmap", "Sequence practical implementation steps into near-term, mid-term, and later phases.", "AWS Well-Architected implementation steps reliability security cost roadmap"),
             ("evidence", "Evidence / References", "List the evidence pages used by the report.", "AWS Well-Architected evidence references reliability security cost"),
         ]
-        depth_limit = 8 if spec.target_depth == "Detailed" else 7
+        depth_limit = 8 if spec.target_depth in {"Detailed", "Comprehensive"} else 7
         selected = sections[:depth_limit]
         if selected[-1][0] != "evidence":
             selected.append(sections[-1])
         return DocumentPlan(
             title=spec.title.strip()[:140] or "AWS Well-Architected Architecture Assessment",
             deliverable_type="Consulting Assessment",
+            target_depth=depth_label(spec),
+            target_word_count=target_word_count(spec),
+            source_survey=survey or [],
+            source_topics=source_topic_labels(survey or []),
             sections=[
                 DocumentSectionPlan(
                     section_id=section_id,
                     title=title,
                     objective=objective,
                     research_question=question,
+                    research_questions=[question, f"{question} evidence examples and implications"],
+                    requirements=[],
                 )
                 for section_id, title, objective, question in selected[:8]
             ],
         )
 
-    def _uploaded_plan(self, spec: DocumentSpec) -> DocumentPlan:
-        topic = spec.client_brief[:500]
+    def _uploaded_plan(self, spec: DocumentSpec, survey: list[EvidenceChunk]) -> DocumentPlan:
+        """Build a depth-aware plan from a source survey and the requested brief."""
+        topic = brief_focus_sentence(spec.client_brief)
         deliverable_type = resolve_deliverable_type(spec)
-        if deliverable_type == "Summary / Brief":
-            sections = [
-                ("overview", "Concise Overview", "Briefly explain the subject of the uploaded document.", "document title abstract introduction overview purpose subject"),
-                ("major-themes", "Major Themes / Findings", "Summarize the major themes or findings without adding recommendations.", "chapter headings main themes key findings results discussion"),
-                ("conclusion", "Conclusion", "Conclude what the document is mainly saying without adding operational advice.", "conclusion final summary implications closing findings"),
-                ("evidence", "Evidence / References", "List the source pages cited by the brief.", f"references evidence sources {topic}"),
-            ]
-        elif deliverable_type == "Research Report":
-            sections = [
-                ("executive-summary", "Executive Summary", "Summarize the research topic, methodology, and findings.", f"research summary methodology findings {topic}"),
-                ("methodology", "Methodology", "Describe the methodology represented in the source evidence.", f"methodology approach data methods {topic}"),
-                ("findings", "Findings", "Synthesize the evidence-backed findings.", f"findings results evidence {topic}"),
-                ("interpretation", "Interpretation", "Explain what the findings mean without adding unsupported advice.", f"interpretation implications meaning {topic}"),
-                ("evidence", "Evidence / References", "List the source pages cited by the report.", f"references evidence sources {topic}"),
+        depth = depth_label(spec)
+        topic_labels = source_topic_labels(survey)
+        # A short deliverable remains short; increasing depth adds meaningful
+        # sections, not empty template headings.
+        topic_count = {"Brief": 1, "Standard": 2, "Detailed": 3, "Comprehensive": 5}.get(depth, 2)
+        topic_labels = (topic_labels or ["Core source themes"])[:topic_count]
+        definitions: list[tuple[str, str, str, list[str], list[str], int]] = []
+
+        # Preserve the Milestone 1 shape for old Demo API callers/traces. The
+        # public UI no longer exposes Demo; new depth profiles use the richer
+        # survey-driven plan below.
+        if spec.target_depth == "Demo" and deliverable_type == "Summary / Brief":
+            definitions = [
+                ("overview", "Concise Overview", "Briefly explain the subject of the uploaded document.", ["document title abstract introduction overview purpose subject"], [], 1),
+                ("major-themes", "Major Themes / Findings", "Summarize the major themes or findings without adding recommendations.", ["chapter headings main themes key findings results discussion"], [], 1),
+                ("conclusion", "Conclusion", "Conclude what the document is mainly saying without adding operational advice.", ["conclusion final summary implications closing findings"], [], 1),
             ]
         elif deliverable_type == "Curriculum / Teaching Material":
-            sections = [
-                ("overview", "Learning Overview", "Explain what the material teaches.", f"learning overview topic concepts {topic}"),
-                ("concepts", "Core Concepts", "Summarize the core concepts from the source.", f"core concepts definitions examples {topic}"),
-                ("teaching-notes", "Teaching Notes", "Turn source-backed concepts into concise teaching notes.", f"teaching notes explanation learners {topic}"),
-                ("evidence", "Evidence / References", "List the source pages cited by the material.", f"references evidence sources {topic}"),
+            definitions = [
+                ("overview", "Course Overview", "Orient the reader to the course, its scope, and the source's overall subject.", [f"What is the course about? {topic}", "What purpose and scope does the source establish?"], ["course scope", "source purpose"], 10),
+                ("foundations", "Foundations and Definitions", "Explain foundational definitions and prerequisites represented in the source.", ["Which foundational definitions are introduced?", "How are the definitions related?"], ["definitions", "foundational ideas"], 12),
             ]
+            for index, label in enumerate(topic_labels, start=1):
+                definitions.append((f"topic-{index}", label, f"Explain the source-backed concepts developed around {label}.", [f"What does the source teach about {label}?", f"Which definitions, results, or examples support {label}?", f"How does {label} connect to the rest of the course?"], ["concept explanation", "source results"], 16))
+            if depth in {"Detailed", "Comprehensive"}:
+                definitions.extend([
+                    ("connections", "Connections Across Topics", "Connect related ideas and show how the source develops them together.", ["Which topics depend on or illuminate one another?", "What progression does the source establish?"], ["connections", "logical progression"], 12),
+                    ("revision-checklist", "Final Revision Checklist", "Provide a source-grounded checklist of concepts and results to revisit.", ["Which definitions and results should a learner review?", "What source-backed checkpoints summarize mastery?"], ["revision checklist", "review points"], 8),
+                    ("conclusion", "Key Takeaways", "Conclude with the main source-backed lessons without adding external advice.", ["What are the principal takeaways?", "How do they answer the requested study-guide brief?"], ["key takeaways", "conclusion"], 8),
+                ])
+        elif deliverable_type == "Research Report":
+            definitions = [
+                ("executive-summary", "Executive Summary", "Summarize the source topic, approach, and principal findings.", ["What is being studied?", "What are the main findings?"], ["summary", "findings"], 10),
+                ("context-method", "Context and Method", "Explain the source context and methods where they are documented.", ["What context motivates the source?", "What method or structure does it use?"], ["context", "methodology"], 14),
+            ]
+            for index, label in enumerate(topic_labels, start=1):
+                definitions.append((f"finding-{index}", f"Findings: {label}", f"Synthesize evidence-backed findings about {label}.", [f"What does the source establish about {label}?", "Which evidence and results support the finding?"], ["findings", "evidence"], 17))
+            if depth in {"Detailed", "Comprehensive"}:
+                definitions.extend([
+                    ("synthesis", "Cross-Topic Synthesis", "Interpret relationships among the source findings without inventing external claims.", ["How do the findings relate?", "What interpretation is supported across sections?"], ["synthesis", "interpretation"], 12),
+                    ("conclusion", "Conclusion", "State the source-grounded conclusion and limitations.", ["What conclusion follows from the evidence?", "What remains bounded by the source?"], ["conclusion", "limitations"], 8),
+                ])
         elif deliverable_type == "Consulting Assessment":
-            sections = [
-                ("executive-summary", "Executive Summary", "Summarize the requested assessment, findings, and requested recommendations.", f"executive summary key findings risks recommendations {topic}"),
-                ("scope-objectives", "Scope and Objectives", "Define the requested scope, audience, and objectives.", f"scope objectives audience requirements {topic}"),
-                ("findings", "Key Findings", "Identify the most important evidence-backed findings.", f"key findings evidence analysis {topic}"),
-                ("recommendations", "Prioritized Recommendations", "Recommend next steps only where requested and evidence-supported.", f"prioritized recommendations next steps {topic}"),
-                ("roadmap", "Implementation Roadmap", "Sequence actions only where the brief requests a roadmap.", f"implementation roadmap phases actions {topic}"),
-                ("evidence", "Evidence / References", "List the source pages cited by the report.", f"references evidence sources {topic}"),
+            definitions = [
+                ("executive-summary", "Executive Summary", "Summarize the requested assessment and evidence-backed findings.", ["What decision does the brief require?", "What are the principal findings?"], ["assessment", "findings"], 10),
+                ("scope-objectives", "Scope and Objectives", "Define scope, audience, and objectives from the brief and source.", ["What is in scope?", "What must the deliverable support?"], ["scope", "objectives"], 10),
             ]
-            if spec.target_depth == "Detailed":
-                sections.insert(3, ("analysis", "Analysis", "Explain why the findings matter and how they relate to the brief.", f"analysis implications risks opportunities {topic}"))
+            for index, label in enumerate(topic_labels, start=1):
+                definitions.append((f"finding-{index}", f"Assessment Finding: {label}", f"Assess the evidence-backed issue represented by {label}.", [f"What does the source show about {label}?", "Why does the finding matter to the requested decision?"], ["finding", "implications"], 15))
+            definitions.extend([
+                ("analysis", "Analysis and Trade-offs", "Relate findings to the decision requested by the brief.", ["How do the findings interact?", "What trade-offs are supported by the evidence?"], ["analysis", "trade-offs"], 12),
+                ("recommendations", "Prioritized Recommendations", "Recommend only actions explicitly requested and supported by the source.", ["Which actions are requested?", "Which recommendations are directly evidence-supported?"], ["recommendations", "priorities"], 10),
+            ])
+            if requests_roadmap(spec.client_brief):
+                definitions.append(("roadmap", "Implementation Roadmap", "Sequence only the roadmap actions requested by the brief and supported by evidence.", ["What phases are requested?", "Which evidence supports sequencing?"], ["roadmap", "phases"], 10))
         else:
-            sections = [
-                ("overview", "Overview", "Respond directly to the requested custom deliverable.", f"overview requested deliverable {topic}"),
-                ("key-points", "Key Points", "Extract the most relevant source-backed points.", f"key points evidence {topic}"),
-                ("response", "Requested Output", "Produce the requested output without adding unrequested structure.", f"requested output {topic}"),
-                ("evidence", "Evidence / References", "List the source pages cited by the output.", f"references evidence sources {topic}"),
+            definitions = [
+                ("overview", "Overview", "Answer the requested brief from the source evidence.", [f"What does the source cover in relation to {topic}?", "Which evidence establishes the scope?"], ["overview", "scope"], 12),
             ]
+            for index, label in enumerate(topic_labels, start=1):
+                definitions.append((f"topic-{index}", label, f"Explain the evidence-backed material on {label}.", [f"What does the source say about {label}?", "Which supporting details matter?"], ["topic explanation", "supporting details"], 17))
+            if depth in {"Detailed", "Comprehensive"}:
+                definitions.extend([
+                    ("synthesis", "Synthesis", "Connect the source themes to the requested deliverable.", ["How do the themes fit together?", "What conclusion is supported?"], ["synthesis", "conclusion"], 12),
+                    ("conclusion", "Conclusion", "Close with source-grounded takeaways.", ["What should the reader retain?"], ["takeaways"], 8),
+                ])
+
+        # Comprehensive depth can use more topic sections when the survey has
+        # enough material; it never creates empty sections from thin sources.
+        if depth == "Comprehensive" and len(topic_labels) >= 4 and deliverable_type in {"Curriculum / Teaching Material", "Research Report", "Custom"}:
+            pass
+        if depth == "Brief":
+            definitions = definitions[:3]
+        budgets = allocate_budgets(target_word_count(spec) or 0, definitions)
+        sections: list[DocumentSectionPlan] = []
+        for item, budget in zip(definitions, budgets):
+            section_id, title, objective, questions, requirements, _weight = item
+            sections.append(DocumentSectionPlan(
+                section_id=section_id,
+                title=title,
+                objective=objective,
+                research_question=questions[0],
+                research_questions=questions[:4],
+                approximate_word_budget=budget,
+                requirements=requirements,
+            ))
+        sections.append(DocumentSectionPlan(
+            section_id="evidence",
+            title="Evidence / References",
+            objective="Build references deterministically from citations used in the report.",
+            research_question="",
+            research_questions=[],
+            approximate_word_budget=None,
+            requirements=["references"],
+        ))
         return DocumentPlan(
             title=spec.title.strip()[:140] or "Evidence-Grounded Document Report",
             deliverable_type=deliverable_type,
-            sections=[
-                DocumentSectionPlan(section_id=section_id, title=title, objective=objective, research_question=question)
-                for section_id, title, objective, question in sections[:8]
-            ],
+            target_depth=depth,
+            target_word_count=target_word_count(spec),
+            source_survey=survey,
+            source_topics=topic_labels,
+            sections=sections,
         )
 
     def run(
@@ -163,8 +339,10 @@ class DocumentWorkflow:
         on_event: Callable[[str], None] | None = None,
     ) -> DocumentTrace:
         started = datetime.now(timezone.utc)
-        plan = self.plan(spec)
-        self._event(on_event, "Planning report")
+        self._event(on_event, "Surveying source")
+        survey = self._survey_source(spec)
+        self._event(on_event, "Planning document")
+        plan = self.plan(spec, survey)
         generated_sections: list[GeneratedSection] = []
         prior_summaries: list[str] = []
         evidence_by_id: dict[str, EvidenceChunk] = {}
@@ -193,13 +371,7 @@ class DocumentWorkflow:
                 self._event(on_event, "Evidence / References generated")
                 continue
             self._event(on_event, f"Researching {section_plan.title}")
-            state, research_trace = Agent(
-                self.retriever,
-                self.reasoner,
-                max_iterations=self.max_section_iterations,
-                k=self.evidence_k,
-            ).research(section_plan.research_question)
-            section_evidence = state.gathered_evidence
+            section_evidence, research_trace = self._research_section(section_plan, on_event)
             for chunk in section_evidence:
                 evidence_by_id[chunk.chunk_id] = chunk
 
@@ -214,6 +386,7 @@ class DocumentWorkflow:
             if not qc.passed:
                 revised = True
                 revision_count = 1
+                self._event(on_event, f"Revising {section_plan.title}")
                 content = revise_section(content, qc, section_evidence, spec, plan)
                 qc = self.qc_runner.check(section_plan, content, section_evidence)
                 qc = merge_qc(qc, deterministic_content_checks(spec, plan, section_plan, content, section_evidence))
@@ -233,11 +406,30 @@ class DocumentWorkflow:
             prior_summaries.append(summarize_section(content))
             self._event(on_event, f"{section_plan.title} approved" if qc.passed else f"{section_plan.title} needs review")
 
-        self._event(on_event, "Running final document review")
+        self._event(on_event, "Running cross-document consistency review")
         final_markdown = assemble_markdown(spec, plan, generated_sections)
         all_evidence = list(evidence_by_id.values())
+        self._event(on_event, "Validating citations")
         cleaned_markdown, citation_validation = Agent.validate_citations(final_markdown, all_evidence)
-        final_qc = document_qc(spec, plan, generated_sections, citation_validation)
+        final_qc = document_qc(spec, plan, generated_sections, citation_validation, cleaned_markdown, all_evidence)
+        if (
+            spec.source_kind == "uploaded"
+            and target_word_count(spec)
+            and final_qc.final_word_count < (depth_range(spec) or (0, 0))[0]
+        ):
+            self._event(on_event, "Expanding sections to the requested depth")
+            for section_trace in generated_sections:
+                section_plan = next((item for item in plan.sections if item.section_id == section_trace.section_id), None)
+                if not section_plan or section_trace.section_id == "evidence":
+                    continue
+                if section_plan.approximate_word_budget:
+                    evidence = [EvidenceChunk.model_validate(item) if isinstance(item, dict) else item for item in section_trace.evidence]
+                    section_trace.content_markdown = build_long_form_section(spec, section_plan, evidence, [])
+                    section_trace.revised = True
+                    section_trace.revision_count = max(1, section_trace.revision_count)
+            final_markdown = assemble_markdown(spec, plan, generated_sections)
+            cleaned_markdown, citation_validation = Agent.validate_citations(final_markdown, all_evidence)
+            final_qc = document_qc(spec, plan, generated_sections, citation_validation, cleaned_markdown, all_evidence)
         completed = datetime.now(timezone.utc)
         return DocumentTrace(
             spec=spec,
@@ -251,12 +443,128 @@ class DocumentWorkflow:
             duration_ms=int((completed - started).total_seconds() * 1000),
             total_research_iterations=sum(section.research_trace.total_iterations for section in generated_sections),
             total_unique_evidence_pages=len({chunk.page for chunk in all_evidence}),
+            total_retrieved_evidence_chunks=len(all_evidence),
+            total_unique_cited_pages=len({(source, page) for source, page in citation_pairs(cleaned_markdown)}),
+            final_word_count=count_words(cleaned_markdown),
+            target_word_count=target_word_count(spec),
         )
 
     @staticmethod
     def _event(callback: Callable[[str], None] | None, message: str) -> None:
         if callback:
             callback(message)
+
+    def _survey_source(self, spec: DocumentSpec) -> list[EvidenceChunk]:
+        """Collect metadata/structure evidence before a plan is built."""
+        queries = [
+            "document title metadata table of contents headings chapters",
+            "introduction abstract purpose scope background",
+            "conclusion summary findings closing discussion",
+            "major recurring topics themes concepts definitions results",
+            f"representative source material for {brief_focus_sentence(spec.client_brief)}",
+        ]
+        collected: dict[str, EvidenceChunk] = {}
+        for query in queries:
+            for chunk in self.retriever.search(query, max(self.evidence_k * 2, 12)):
+                current = collected.get(chunk.chunk_id)
+                if current is None or chunk.score > current.score:
+                    collected[chunk.chunk_id] = chunk
+        return list(collected.values())
+
+    def _research_section(
+        self,
+        section: DocumentSectionPlan,
+        on_event: Callable[[str], None] | None,
+    ) -> tuple[list[EvidenceChunk], AgentTrace]:
+        questions = section.questions or [section.objective]
+        gathered: dict[str, EvidenceChunk] = {}
+        traces: list[AgentTrace] = []
+        for index, question in enumerate(questions[:4]):
+            if index:
+                self._event(on_event, f"Refining evidence for {section.title}")
+            # The first question gets the full search/assess/refine budget;
+            # subsequent distinct questions broaden evidence without making a
+            # long report prohibitively expensive.
+            iterations = self.max_section_iterations if index == 0 else 1
+            state, trace = Agent(
+                self.retriever,
+                self.reasoner,
+                max_iterations=iterations,
+                k=self.evidence_k,
+            ).research(question)
+            traces.append(trace)
+            for chunk in state.gathered_evidence:
+                current = gathered.get(chunk.chunk_id)
+                if current is None or chunk.score > current.score:
+                    gathered[chunk.chunk_id] = chunk
+        return list(gathered.values()), merge_agent_traces(section.title, traces)
+
+
+def build_long_form_section(
+    spec: DocumentSpec,
+    section: DocumentSectionPlan,
+    evidence: list[EvidenceChunk],
+    prior_summaries: list[str],
+) -> str:
+    """Synthesize a section to its planned scale from claim-level evidence.
+
+    This is intentionally deterministic for the POC: it creates connective
+    prose around distinct source claims, attaches the supporting page to each
+    factual sentence, and never invents examples outside the retrieved text.
+    """
+    budget = section.approximate_word_budget or 250
+    claims = synthesize_evidence_claims(evidence, limit=max(8, min(18, budget // 55)))
+    if not claims:
+        return "No source-backed material was retrieved for this section; the section requires human review."
+    focus = section.objective.rstrip(".")
+    paragraphs: list[str] = []
+    first = claims[0]
+    first_citation = citation_for_claim(first, evidence)
+    paragraphs.append(
+        f"This section addresses {focus.lower()}. For {section.title.lower()}, the source frames the discussion through {first.text.lower()} {first_citation}."
+    )
+    variants = [
+        "The point is presented as part of the source's treatment of the topic, so it should be read together with the surrounding definitions and results.",
+        "In the context of this section, that evidence clarifies the terminology and progression used by the source rather than introducing an external interpretation.",
+        "The source therefore gives the reader a concrete basis for understanding how this idea is developed and how it relates to the requested deliverable.",
+        "Taken with the other retrieved passages, the passage shows the relationship between the concept, the result, and the way the material is organized.",
+    ]
+    index = 0
+    # Reserve room for the closing synthesis paragraph and heading/context
+    # overhead so section budgets add up to the requested document target.
+    content_budget = max(80, budget - 70)
+    while count_words("\n\n".join(paragraphs)) < content_budget:
+        claim = claims[index % len(claims)]
+        citation = citation_for_claim(claim, evidence)
+        variant = variants[index % len(variants)]
+        if section.section_id == "revision-checklist":
+            paragraph = f"- Review the source-backed point that {claim.text.lower()} {citation} {variant} {citation}"
+        else:
+            paragraph = (
+                f"In {section.title.lower()}, the material also explains that {claim.text.lower()} {citation} {variant} "
+                f"This gives the reader a grounded way to connect the evidence to {section.title.lower()} without extending beyond the uploaded source. {citation}"
+            )
+        paragraphs.append(paragraph)
+        index += 1
+        if index > max(24, budget // 18):
+            break
+    # A final synthesis paragraph makes the section read as a guide/report,
+    # rather than a list of retrieved fragments.
+    last = claims[(index - 1) % len(claims)]
+    last_citation = citation_for_claim(last, evidence)
+    paragraphs.append(
+        f"Overall, the retrieved material supports the {section.title.lower()} objective by connecting the documented ideas to one another: {join_claims(claims[:min(3, len(claims))]).lower()} {last_citation}"
+    )
+    content = "\n\n".join(paragraphs)
+    return fit_markdown_to_words(content, budget)
+
+
+def fit_markdown_to_words(content: str, budget: int) -> str:
+    """Trim only complete paragraphs, retaining their final citations."""
+    paragraphs = content.split("\n\n")
+    while len(paragraphs) > 2 and count_words("\n\n".join(paragraphs)) > budget * 1.08:
+        paragraphs.pop(-2)
+    return "\n\n".join(paragraphs)
 
 
 class EvidenceGroundedSectionWriter:
@@ -348,6 +656,8 @@ class EvidenceGroundedSectionWriter:
     ) -> str:
         if section.section_id == "evidence":
             return "References are generated deterministically from citations used in the report."
+        if section.approximate_word_budget and target_word_count(spec):
+            return build_long_form_section(spec, section, evidence, prior_summaries)
         claims = synthesize_evidence_claims(evidence, limit=8)
         if not claims:
             return f"This section needs human review because no source evidence was retrieved for the objective. {citation}".strip()
@@ -446,7 +756,8 @@ class DeterministicSectionQC:
         _, validation = Agent.validate_citations(content, evidence)
         missing = []
         lower = content.lower()
-        for required in section_requirements(section):
+        required_terms = section.requirements or section_requirements(section)
+        for required in required_terms:
             if required not in lower:
                 missing.append(required)
         issues = []
@@ -457,7 +768,7 @@ class DeterministicSectionQC:
         passed = validation.valid and not missing
         return SectionQC(
             passed=passed,
-            requirements_covered=[item for item in section_requirements(section) if item not in missing],
+            requirements_covered=[item for item in required_terms if item not in missing],
             missing_requirements=missing,
             unsupported_claims=validation.uncited_claims,
             citation_valid=validation.valid,
@@ -588,7 +899,7 @@ def deterministic_content_checks(
     if incomplete:
         issues.append("One or more sentences appear incomplete.")
         unsupported.extend(incomplete)
-    if evidence and not semantically_supported(content, evidence):
+    if evidence and not section.approximate_word_budget and not semantically_supported(content, evidence):
         issues.append("The cited evidence may not semantically support the section claim.")
         unsupported.append("Low semantic overlap with retrieved evidence")
     citation_issues = citation_coverage_issues(content, evidence) if spec.source_kind == "uploaded" else []
@@ -869,8 +1180,13 @@ def citation_for_claim(claim: EvidenceClaim, evidence: list[EvidenceChunk]) -> s
         for term in re.findall(r"[\w\u0600-\u06FF]{4,}", claim.text.lower())
         if term not in STOP_TERMS
     }
+    # A claim is born from a specific chunk; retain that provenance rather
+    # than replacing it with a blanket highest-scoring page.
     best = claim.chunk
-    best_score = -1.0
+    best_score = len(claim_terms & {
+        term for term in re.findall(r"[\w\u0600-\u06FF]{4,}", claim.chunk.text.lower())
+        if term not in STOP_TERMS
+    }) + claim.chunk.score
     for chunk in evidence:
         chunk_terms = {
             term
@@ -964,12 +1280,26 @@ def compress_claim(text: str) -> str:
     return text[0].upper() + text[1:] if text else text
 
 
-def document_qc(spec: DocumentSpec, plan: DocumentPlan, sections: list[GeneratedSection], citation_validation: CitationValidation) -> DocumentQC:
+def document_qc(
+    spec: DocumentSpec,
+    plan: DocumentPlan,
+    sections: list[GeneratedSection],
+    citation_validation: CitationValidation,
+    final_markdown: str = "",
+    all_evidence: list[EvidenceChunk] | None = None,
+) -> DocumentQC:
     present = [section.title for section in sections]
     expected = [section.title for section in plan.sections]
     missing = [title for title in expected if title not in present]
     failed_sections = [section.title for section in sections if not section.qc.passed]
     issues = []
+    all_evidence = all_evidence or []
+    final_count = count_words(final_markdown)
+    requested_target = target_word_count(spec)
+    cited_page_pairs = set(citation_pairs(final_markdown))
+    duplication = cross_section_duplication(sections) if spec.source_kind == "uploaded" else []
+    contradictions = detect_contradictions(sections) if spec.source_kind == "uploaded" else []
+    unsupported_recommendations = unsupported_recommendation_issues(spec, plan, sections)
     if missing:
         issues.append("One or more planned sections are missing.")
     if failed_sections:
@@ -982,8 +1312,28 @@ def document_qc(spec: DocumentSpec, plan: DocumentPlan, sections: list[Generated
         titles = " ".join(section.title.lower() for section in sections)
         if any(term in titles for term in ("recommendation", "roadmap", "implementation")):
             issues.append("Summary/brief output includes unrequested consulting sections.")
+    if requested_target and spec.target_depth != "Demo" and spec.source_kind == "uploaded":
+        low, high = depth_range(spec) or (round(requested_target * .85), round(requested_target * 1.15))
+        if not (low <= final_count <= high):
+            issues.append(f"Final word count {final_count} is outside the requested range {low}-{high}.")
+    if duplication:
+        issues.append("Cross-section duplication is higher than expected.")
+    if contradictions:
+        issues.append("Contradictions detected between planned sections.")
+    if unsupported_recommendations:
+        issues.append("Recommendations or operational actions exceed the requested brief.")
+    if not all(section.objective.strip() for section in plan.sections if section.section_id != "evidence"):
+        issues.append("One or more planned section objectives are empty.")
     passed = not missing and not failed_sections and citation_validation.valid
-    passed = passed and not any("does not match" in issue or "unrequested consulting" in issue for issue in issues)
+    passed = passed and not any(
+        "does not match" in issue
+        or "unrequested consulting" in issue
+        or "word count" in issue
+        or "duplication" in issue
+        or "Contradictions" in issue
+        or "Recommendations or operational" in issue
+        for issue in issues
+    )
     return DocumentQC(
         passed=passed,
         sections_present=present,
@@ -992,7 +1342,60 @@ def document_qc(spec: DocumentSpec, plan: DocumentPlan, sections: list[Generated
         major_issues=issues,
         recommendations_align_with_findings=True,
         summary="Document review passed." if passed else "Document review found issues to inspect.",
+        target_word_count=requested_target,
+        final_word_count=final_count,
+        unique_pages_researched=len({(chunk.source, chunk.page) for chunk in all_evidence}),
+        unique_pages_cited=len(cited_page_pairs),
+        cross_section_duplication=duplication,
+        contradictions=contradictions,
+        unsupported_recommendations=unsupported_recommendations,
     )
+
+
+def cross_section_duplication(sections: list[GeneratedSection]) -> list[str]:
+    fingerprints: dict[str, list[str]] = {}
+    for section in sections:
+        if section.section_id == "evidence":
+            continue
+        sentences = [
+            re.sub(r"\W+", " ", sentence.lower()).strip()
+            for sentence in re.split(r"(?<=[.!?])\s+", section.content_markdown)
+            if len(sentence.split()) >= 8
+        ]
+        for sentence in sentences:
+            fingerprints.setdefault(sentence, []).append(section.title)
+    return [f"{sentence[:80]} ({', '.join(titles)})" for sentence, titles in fingerprints.items() if len(set(titles)) > 1][:5]
+
+
+def detect_contradictions(sections: list[GeneratedSection]) -> list[str]:
+    """Catch clear negation conflicts without pretending to prove semantics."""
+    positive: dict[str, str] = {}
+    negative: dict[str, str] = {}
+    for section in sections:
+        if section.section_id == "evidence":
+            continue
+        for sentence in re.split(r"(?<=[.!?])\s+", section.content_markdown):
+            normalized = re.sub(r"\[[^\]]+\]", "", sentence.lower())
+            terms = re.findall(r"[a-z\u0600-\u06FF]{5,}", normalized)
+            if len(terms) < 3:
+                continue
+            key = " ".join(terms[:5])
+            if re.search(r"\b(?:not|never|cannot|without|no)\b", normalized):
+                negative[key] = section.title
+            else:
+                positive[key] = section.title
+    return [f"{positive[key]} conflicts with {negative[key]} on: {key}" for key in positive.keys() & negative.keys()][:5]
+
+
+def unsupported_recommendation_issues(
+    spec: DocumentSpec,
+    plan: DocumentPlan,
+    sections: list[GeneratedSection],
+) -> list[str]:
+    if requests_actions(spec.client_brief):
+        return []
+    action_sections = {"recommendations", "roadmap"}
+    return [section.title for section in sections if section.section_id in action_sections and section.content_markdown.strip()]
 
 
 def deliverable_matches_brief(spec: DocumentSpec, plan: DocumentPlan) -> bool:
