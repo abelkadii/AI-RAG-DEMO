@@ -194,7 +194,7 @@ class DocumentWorkflow:
                 title=section_plan.title,
                 objective=section_plan.objective,
                 content_markdown=content,
-                evidence=section_evidence,
+                evidence=serializable_evidence(section_evidence),
                 research_trace=research_trace,
                 qc=qc,
                 revised=revised,
@@ -618,6 +618,28 @@ def cite_page(evidence: list[EvidenceChunk]) -> str:
         return ""
     best = max(evidence, key=lambda chunk: chunk.score)
     return f"[{best.source} p.{best.page}]"
+
+
+def serializable_evidence(evidence: list[EvidenceChunk]) -> list[dict]:
+    """Avoid Streamlit/Pydantic class-identity issues after hot reloads."""
+    serialized = []
+    for chunk in evidence:
+        if hasattr(chunk, "model_dump"):
+            serialized.append(chunk.model_dump())
+        elif isinstance(chunk, dict):
+            serialized.append(chunk)
+        else:
+            serialized.append(
+                {
+                    "chunk_id": getattr(chunk, "chunk_id"),
+                    "page": getattr(chunk, "page"),
+                    "text": getattr(chunk, "text"),
+                    "score": getattr(chunk, "score", 0.0),
+                    "section": getattr(chunk, "section", None),
+                    "source": getattr(chunk, "source", "Uploaded document"),
+                }
+            )
+    return serialized
 
 
 def summarize_section(content: str) -> str:

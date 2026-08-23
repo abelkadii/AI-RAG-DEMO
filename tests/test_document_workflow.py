@@ -1,6 +1,6 @@
 from document_export import docx_bytes, markdown_bytes
 from document_models import DocumentSpec, SectionQC
-from document_workflow import DEFAULT_BRIEF, DocumentWorkflow, resolve_deliverable_type
+from document_workflow import DEFAULT_BRIEF, DocumentWorkflow, resolve_deliverable_type, serializable_evidence
 from llm import LocalReasoner
 from models import EvidenceChunk
 from uploaded_corpus import clean_uploaded_text, extract_pdf_bytes
@@ -164,6 +164,13 @@ def test_uploaded_text_cleaning_removes_slide_counters_and_fragments_preserves_a
     assert "Slide 2 of 9" not in text
     assert "Confidential" not in text
     assert "هذا العرض" in text
+
+
+def test_serializable_evidence_handles_hot_reload_model_identity():
+    chunk = EvidenceChunk(chunk_id="doc-p001-c00", page=1, text="A complete source-backed sentence.", source="doc.pdf")
+    serialized = serializable_evidence([chunk])
+    assert serialized == [chunk.model_dump()]
+    assert serialized[0]["source"] == "doc.pdf"
 
 
 def test_references_are_built_from_citations_used_in_report():
