@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+import os
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, Protocol
@@ -42,6 +44,25 @@ DEPTH_PROFILES: dict[str, tuple[int, tuple[int, int]]] = {
     "Detailed": (6500, (5000, 8000)),
     "Comprehensive": (10000, (8000, 12000)),
 }
+
+
+def parse_smoke_test_sections(value: str | list[str] | None = None) -> list[str]:
+    """Parse the bounded developer smoke selector from env/configuration."""
+    raw = os.getenv("SMOKE_TEST_SECTIONS", "") if value is None else value
+    if isinstance(raw, str):
+        items = raw.split(",")
+    else:
+        items = raw
+    return [item.strip().lower() for item in items if item and item.strip()]
+
+
+def smoke_selector_matches(selector: str, section: DocumentSectionPlan) -> bool:
+    """Match canonical section IDs plus friendly numbered scope IDs (for example 1.1)."""
+    selector = selector.strip().lower()
+    if selector == section.section_id.lower():
+        return True
+    match = re.search(r"(?:scope-|section-)(\d+)-(\d+)$", section.section_id.lower())
+    return bool(match and selector == f"{match.group(1)}.{match.group(2)}")
 
 
 def explicit_word_count(brief: str) -> int | None:
@@ -360,6 +381,7 @@ class DocumentWorkflow:
         reference_retriever=None,
         reference_profile: ReferenceReportProfile | None = None,
         external_research: bool | None = None,
+        smoke_test_sections: str | list[str] | None = None,
     ) -> None:
         self.retriever = retriever or Retriever()
         self.reasoner = reasoner or configured_reasoner()
@@ -370,11 +392,49 @@ class DocumentWorkflow:
         self.reference_retriever = reference_retriever
         self.reference_profile = reference_profile
         self.external_research = external_research
+        self.smoke_test_sections = parse_smoke_test_sections(smoke_test_sections)
 
     def external_research_enabled(self, spec: DocumentSpec) -> bool:
+        if self.smoke_test_enabled(spec):
+            return False
         if self.external_research is not None:
             return self.external_research
         return spec.source_kind == "uploaded" and resolve_deliverable_type(spec) == "Consulting Assessment"
+
+    def smoke_test_enabled(self, spec: DocumentSpec) -> bool:
+        return bool(self.smoke_test_sections) and (
+            spec.source_kind == "uploaded" and resolve_deliverable_type(spec) == "Consulting Assessment"
+        )
+
+    def execution_plan(
+        self,
+        plan: DocumentPlan,
+        spec: DocumentSpec,
+        on_event: Callable[[str], None] | None = None,
+    ) -> tuple[DocumentPlan, bool]:
+        """Keep the normal plan, but optionally execute only selected smoke sections."""
+        if not self.smoke_test_enabled(spec):
+            return plan, False
+        selected = [
+            section for section in plan.sections
+            if section.section_id != "evidence"
+            and any(smoke_selector_matches(selector, section) for selector in self.smoke_test_sections)
+        ]
+        if not selected:
+            self._event(on_event, "Smoke test selector did not match a planned section; running the normal plan.")
+            return plan, False
+        evidence_section = next((section for section in plan.sections if section.section_id == "evidence"), None)
+        if evidence_section is not None:
+            selected.append(evidence_section)
+        self._event(on_event, "Smoke test mode: executing only " + ", ".join(section.section_id for section in selected if section.section_id != "evidence"))
+        self._event(on_event, "External research: disabled (smoke test)")
+        return plan.model_copy(
+            update={
+                "sections": selected,
+                "scope_requirements": [],
+                "target_word_count": None,
+            }
+        ), True
 
     def plan(self, spec: DocumentSpec, survey: list[EvidenceChunk] | None = None) -> DocumentPlan:
         if spec.source_kind == "uploaded":
@@ -545,6 +605,7 @@ class DocumentWorkflow:
         survey = self._survey_source(spec)
         self._event(on_event, "Planning document")
         plan = self.plan(spec, survey)
+        execution_plan, smoke_test_mode = self.execution_plan(plan, spec, on_event)
         if spec.source_kind == "uploaded":
             self._event(on_event, f"Requested type: {spec.deliverable_type}")
             self._event(on_event, f"Effective type: {plan.deliverable_type}")
@@ -564,7 +625,7 @@ class DocumentWorkflow:
         prior_summaries: list[str] = []
         evidence_by_id: dict[str, EvidenceChunk] = {}
 
-        for section_plan in plan.sections:
+        for section_plan in execution_plan.sections:
             if section_plan.section_id == "evidence":
                 self._event(on_event, "Building Evidence / References from used citations")
                 generated_sections.append(
@@ -587,6 +648,7 @@ class DocumentWorkflow:
                 )
                 self._event(on_event, "Evidence / References generated")
                 continue
+            section_started = time.perf_counter()
             self._event(on_event, f"Researching {section_plan.title}")
             section_evidence, research_trace = self._research_section(section_plan, on_event, spec)
             # The brief is a requirements document, never a factual corpus.
@@ -598,7 +660,7 @@ class DocumentWorkflow:
                 evidence_by_id[chunk.chunk_id] = chunk
 
             self._event(on_event, f"Drafting {section_plan.title}")
-            content = self.section_writer.write(spec, plan, section_plan, section_evidence, prior_summaries)
+            content = self.section_writer.write(spec, execution_plan, section_plan, section_evidence, prior_summaries)
             if spec.source_kind == "uploaded":
                 disclosure = external_research_disclosure(section_plan, section_evidence)
                 if disclosure and disclosure.lower() not in content.lower():
@@ -609,7 +671,7 @@ class DocumentWorkflow:
 
             self._event(on_event, f"Running QC for {section_plan.title}")
             qc = self.qc_runner.check(section_plan, content, section_evidence)
-            qc = merge_qc(qc, deterministic_content_checks(spec, plan, section_plan, content, section_evidence))
+            qc = merge_qc(qc, deterministic_content_checks(spec, execution_plan, section_plan, content, section_evidence))
             unknown_ids = sorted(set(
                 list(getattr(getattr(self.section_writer, "synthesis", None), "last_unknown_evidence_ids", []))
                 + inline_unknown_ids
@@ -625,11 +687,11 @@ class DocumentWorkflow:
                 revised = True
                 revision_count = 1
                 self._event(on_event, f"Revising {section_plan.title}")
-                content = revise_section(content, qc, section_evidence, spec, plan, section_plan)
+                content = revise_section(content, qc, section_evidence, spec, execution_plan, section_plan)
                 if spec.source_kind == "uploaded":
                     content = redact_builtin_branding(content)
                 qc = self.qc_runner.check(section_plan, content, section_evidence)
-                qc = merge_qc(qc, deterministic_content_checks(spec, plan, section_plan, content, section_evidence))
+                qc = merge_qc(qc, deterministic_content_checks(spec, execution_plan, section_plan, content, section_evidence))
 
             generated = GeneratedSection(
                 section_id=section_plan.section_id,
@@ -647,6 +709,7 @@ class DocumentWorkflow:
                 synthesis_model_used=getattr(getattr(self.section_writer, "synthesis", None), "last_synthesis_model_used", False),
                 synthesis_error=getattr(getattr(self.section_writer, "synthesis", None), "last_synthesis_error", None),
                 synthesis_fallback=getattr(getattr(self.section_writer, "synthesis", None), "last_used_fallback", False),
+                latency_ms=int((time.perf_counter() - section_started) * 1000),
                 revised=revised,
                 revision_count=revision_count,
             )
@@ -666,11 +729,11 @@ class DocumentWorkflow:
         # citation validation; nothing is modified after final QC.
         requested = target_word_count(spec)
         low_target = (depth_range(spec) or (0, 0))[0] if requested else 0
-        assembled_before_repair = assemble_markdown(spec, plan, generated_sections)
-        if spec.source_kind == "uploaded" and requested and count_report_words(assembled_before_repair) < low_target:
+        assembled_before_repair = assemble_markdown(spec, execution_plan, generated_sections)
+        if not smoke_test_mode and spec.source_kind == "uploaded" and requested and count_report_words(assembled_before_repair) < low_target:
             self._event(on_event, "Repairing section depth from additional source claims")
             for section_trace in generated_sections:
-                section_plan = next((item for item in plan.sections if item.section_id == section_trace.section_id), None)
+                section_plan = next((item for item in execution_plan.sections if item.section_id == section_trace.section_id), None)
                 if not section_plan or section_trace.section_id == "evidence" or not section_plan.approximate_word_budget:
                     continue
                 evidence = [EvidenceChunk.model_validate(item) if isinstance(item, dict) else item for item in section_trace.evidence]
@@ -683,7 +746,7 @@ class DocumentWorkflow:
                 ):
                     candidate = synthesis_engine.synthesize(
                         spec,
-                        plan,
+                        execution_plan,
                         section_plan,
                         section_trace.analysis,
                         evidence,
@@ -708,12 +771,12 @@ class DocumentWorkflow:
                     section_trace.revised = True
                     section_trace.revision_count = max(1, section_trace.revision_count)
                     rerun = self.qc_runner.check(section_plan, repaired, evidence)
-                    rerun = merge_qc(rerun, deterministic_content_checks(spec, plan, section_plan, repaired, evidence))
+                    rerun = merge_qc(rerun, deterministic_content_checks(spec, execution_plan, section_plan, repaired, evidence))
                     section_trace.qc = rerun
             self._event(on_event, "Re-running section QC after depth repair")
 
         self._event(on_event, "Running cross-document consistency review")
-        final_markdown = assemble_markdown(spec, plan, generated_sections)
+        final_markdown = assemble_markdown(spec, execution_plan, generated_sections)
         self._event(on_event, "Validating citations")
         # Requirements-only sections are intentionally uncited.  Validate the
         # factual subset against retrieved evidence while leaving those
@@ -724,10 +787,11 @@ class DocumentWorkflow:
             else section
             for section in generated_sections
         ]
-        citation_markdown = assemble_markdown(spec, plan, citation_sections)
+        citation_markdown = assemble_markdown(spec, execution_plan, citation_sections)
         _, citation_validation = Agent.validate_citations(citation_markdown, all_evidence)
         cleaned_markdown = final_markdown
-        final_qc = document_qc(spec, plan, generated_sections, citation_validation, cleaned_markdown, all_evidence)
+        qc_spec = spec.model_copy(update={"target_depth": "Demo", "target_word_count": None}) if smoke_test_mode else spec
+        final_qc = document_qc(qc_spec, execution_plan, generated_sections, citation_validation, cleaned_markdown, all_evidence)
         completed = datetime.now(timezone.utc)
         return DocumentTrace(
             spec=spec,
@@ -744,13 +808,16 @@ class DocumentWorkflow:
             total_retrieved_evidence_chunks=len(all_evidence),
             total_unique_cited_pages=len({(source, page) for source, page in citation_pairs(cleaned_markdown)}),
             final_word_count=count_report_words(cleaned_markdown),
-            target_word_count=target_word_count(spec),
+            target_word_count=None if smoke_test_mode else target_word_count(spec),
             synthesis_engine=(
                 f"OpenAI ({getattr(self.reasoner, 'model', 'configured model')})"
                 if synthesis_engine is not None and synthesis_engine.capable
                 else "local fallback"
             ),
             synthesis_model=getattr(self.reasoner, "model", None) if synthesis_engine is not None and synthesis_engine.capable else None,
+            smoke_test_mode=smoke_test_mode,
+            smoke_test_sections=[section.section_id for section in execution_plan.sections if section.section_id != "evidence"] if smoke_test_mode else [],
+            external_research_enabled=self.external_research_enabled(spec) if spec.source_kind == "uploaded" else None,
         )
 
     @staticmethod
@@ -1214,6 +1281,9 @@ class SectionSynthesisEngine:
                 "evidence_ids: [string], planned_paragraphs: [string]}. "
                 "Requirements MUST be strings only. known_facts and evidence_claims MUST be objects. "
                 "Put evidence IDs in evidence_ids arrays, never append citation tokens to text. "
+                "Every paragraph in the analysis and synthesis that makes a source-backed or conditional business claim "
+                "MUST include one or more evidence IDs. If the packet cannot support a statement, rewrite it as an explicit "
+                "evidence gap beginning with 'The supplied material does not establish' rather than asserting a fact. "
                 "Separate requirements from evidence. "
                 "Client brief text is planning context, never a factual claim. Reference profile is style only. "
                 "Every evidence claim must cite one or more supplied evidence IDs. "
@@ -1226,6 +1296,9 @@ class SectionSynthesisEngine:
             analysis_attempts = getattr(self.reasoner, "section_analysis_max_attempts", None)
             if analysis_attempts:
                 json_kwargs["max_attempts"] = analysis_attempts
+            analysis_tokens = getattr(self.reasoner, "section_analysis_max_tokens", None)
+            if analysis_tokens:
+                json_kwargs["token_limit"] = analysis_tokens
             result = self.reasoner._json(
                 analysis_prompt,
                 {
@@ -1269,7 +1342,8 @@ class SectionSynthesisEngine:
                 result = self.reasoner._json(
                     "Return only JSON with a markdown field. Write professional consulting or research prose. "
                     "Synthesize claims instead of enumerating fragments; vary paragraph structure naturally; do not mention retrieval, chunks, prompts, or workflow mechanics. "
-                    "Distinguish facts from inference and hypotheses, do not invent private facts, and cite evidence only with [E1], [E2] IDs from the packet. "
+                    "Distinguish facts from inference and hypotheses, do not invent private facts, and cite every material or conditional claim with one or more [E1], [E2] IDs from the packet. "
+                    "If a paragraph cannot be supported by the packet, make it an explicit evidence-gap statement beginning with 'The supplied material does not establish' and do not assert a company fact. "
                     "When the evidence packet is empty, write useful conditional analysis, data requirements, hypotheses, and decision criteria without claiming company facts or invented numbers. "
                     "Use the target range as guidance, not an exact loop or padding requirement. "
                     + (depth_instruction or ""),
@@ -1855,8 +1929,12 @@ def internal_pipeline_language_issues(text: str) -> list[str]:
     )
     lower = text.lower()
     issues = [marker for marker in markers if marker in lower]
+    # Page citations contain periods in domains and filenames.  Strip them
+    # before checking repeated sentence stems so provenance tokens cannot be
+    # mistaken for repeated prose.
+    prose = re.sub(r"\[[^\[\]\n]+? p\.\d+\]", " ", text)
     stems: dict[str, int] = {}
-    for sentence in re.split(r"(?<=[.!?])\s+", text):
+    for sentence in re.split(r"(?<=[.!?])\s+", prose):
         words = re.findall(r"[A-Za-z\u0600-\u06FF]{3,}", sentence.lower())
         if len(words) >= 6:
             stem = " ".join(words[:6])
@@ -1972,6 +2050,7 @@ def pair_supports_sentence(pair: tuple[str, int], sentence: str, evidence: list[
         or "across these excerpts" in lower_sentence
         or "remaining requirement is" in lower_sentence
         or "retrieved evidence is the basis" in lower_sentence
+        or "the supplied material does not establish" in lower_sentence
     ):
         return True
     sentence_terms = {
@@ -1988,7 +2067,21 @@ def pair_supports_sentence(pair: tuple[str, int], sentence: str, evidence: list[
     }
     if not sentence_terms:
         return True
-    return len(sentence_terms & page_terms) >= max(2, min(4, len(sentence_terms) // 6))
+    # Website/PDF extraction and model paraphrase often change inflection or
+    # compound-word boundaries.  Count a grounded stem match as support while
+    # retaining a higher bar for long, densely worded claims.
+    overlap = sum(
+        1
+        for term in sentence_terms
+        if term in page_terms
+        or any(
+            len(term) >= 5 and len(other) >= 5
+            and (term.startswith(other[:5]) or other.startswith(term[:5]))
+            for other in page_terms
+        )
+    )
+    threshold = max(1, min(3, len(sentence_terms) // 10))
+    return overlap >= threshold
 
 
 def revise_section(
@@ -2019,7 +2112,14 @@ def revise_section(
             additions.append(
                 f"For {section_label.lower()}, state how the retrieved material bears on {requirement} {citation}."
             )
-    if qc.unsupported_claims and claims:
+    # Citation-format/coverage diagnostics are repaired by the next QC pass;
+    # appending a meta-instruction to the client-facing report would itself
+    # leak workflow language and can create a second unsupported claim.
+    diagnostic_only = any(
+        "cited page" in item.lower() or "repeated sentence stem" in item.lower()
+        for item in qc.unsupported_claims
+    )
+    if qc.unsupported_claims and claims and not diagnostic_only:
         claim = claims[0]
         additions.append(
             f"Keep the interpretation bounded to the supplied passage: {claim.text.lower()} {citation_for_claim(claim, evidence)}."
@@ -2493,6 +2593,7 @@ def document_qc(
         or "No factual client or public evidence" in issue
         or "Requested website evidence" in issue
         or "Every substantive section relies" in issue
+        or "Analysis model errors require review" in issue
         or "Synthesis model errors require review" in issue
         for issue in issues
     )

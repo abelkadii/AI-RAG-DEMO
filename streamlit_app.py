@@ -50,6 +50,7 @@ def configure_credentials() -> None:
         "OPENAI_JSON_MAX_TOKENS",
         "OPENAI_ANSWER_MAX_TOKENS",
         "LLM_MODE",
+        "SMOKE_TEST_SECTIONS",
         "DEMO_ACCESS_CODE",
     ):
         if os.getenv(key):
@@ -631,6 +632,30 @@ def render_document_results(trace: DocumentTrace) -> None:
         f"Client sources: {', '.join(trace.spec.client_source_names) if trace.spec.client_source_names else ('No client PDFs; website/public evidence only' if trace.spec.source_kind == 'uploaded' else 'AWS sample corpus')} | "
         f"Website: {trace.spec.company_website or 'None'}"
     )
+    if trace.smoke_test_mode:
+        st.info(
+            "Developer smoke test active: executed only "
+            + ", ".join(trace.smoke_test_sections)
+            + "; external research disabled."
+        )
+        with st.expander("Developer smoke diagnostics", expanded=True):
+            for section in trace.sections:
+                if section.section_id == "evidence":
+                    continue
+                st.write(
+                    {
+                        "section": section.section_id,
+                        "analysis_model_used": section.analysis_model_used,
+                        "analysis_normalized": section.analysis_normalized,
+                        "analysis_repair_retry": section.analysis_repair_retry,
+                        "analysis_error": section.analysis_error,
+                        "synthesis_model_used": section.synthesis_model_used,
+                        "synthesis_fallback": section.synthesis_fallback,
+                        "synthesis_error": section.synthesis_error,
+                        "qc": section.qc.passed,
+                        "section_latency_ms": section.latency_ms,
+                    }
+                )
 
     preview, quality, evidence, downloads = st.tabs(["Report Preview", "Quality Review", "Research & Evidence", "Downloads"])
     with preview:
@@ -650,6 +675,9 @@ def render_document_results(trace: DocumentTrace) -> None:
                 st.write(f"QC passed: {section.qc.passed}")
                 st.write(f"Revision count: {section.revision_count}")
                 st.write(f"Citation valid: {section.qc.citation_valid}")
+                st.write(f"Section latency: {section.latency_ms or 0} ms")
+                st.write(f"Analysis model used: {section.analysis_model_used}")
+                st.write(f"Synthesis model used: {section.synthesis_model_used}")
                 if section.qc.issues:
                     st.write(section.qc.issues)
     with evidence:

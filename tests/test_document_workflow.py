@@ -20,6 +20,7 @@ from document_workflow import (
     source_topic_labels,
     build_long_form_section,
     cited_sentences,
+    internal_pipeline_language_issues,
     replace_evidence_ids,
     SectionSynthesisEngine,
     cross_section_duplication,
@@ -560,6 +561,52 @@ def test_empty_section_evidence_still_uses_capable_synthesis_model():
     assert any(section.analysis_model_used and section.synthesis_model_used for section in trace.sections if section.section_id != "evidence")
 
 
+def test_consulting_smoke_mode_executes_only_selected_section_and_disables_external_research(monkeypatch):
+    monkeypatch.setenv("SMOKE_TEST_SECTIONS", "executive-summary")
+    reasoner = CapableSectionReasoner()
+    spec = DocumentSpec(
+        client_brief="Create a business strategy report with market analysis and recommendations.",
+        source_kind="uploaded",
+        deliverable_type="Consulting Assessment",
+    )
+
+    trace = DocumentWorkflow(
+        retriever=DocumentFakeRetriever(),
+        reasoner=reasoner,
+        external_research=True,
+    ).run(spec)
+
+    executed = [section for section in trace.sections if section.section_id != "evidence"]
+    assert trace.smoke_test_mode is True
+    assert trace.smoke_test_sections == ["executive-summary"]
+    assert [section.section_id for section in executed] == ["executive-summary"]
+    assert len(trace.plan.sections) > len(trace.sections)
+    assert trace.external_research_enabled is False
+    assert executed[0].latency_ms is not None
+    assert executed[0].analysis_model_used is True
+    assert executed[0].synthesis_model_used is True
+
+
+def test_consulting_smoke_mode_accepts_numbered_scope_selectors(monkeypatch):
+    for selector, expected in (("1.1", "scope-1-1"), ("1.2", "scope-1-2")):
+        monkeypatch.setenv("SMOKE_TEST_SECTIONS", selector)
+        spec = DocumentSpec(
+            client_brief=(
+                "Create a business strategy report.\nStage 1 — Business Diagnostic\n"
+                "1.1 Organisational Health Check\n1.2 Competitive Landscape"
+            ),
+            source_kind="uploaded",
+            deliverable_type="Consulting Assessment",
+        )
+        trace = DocumentWorkflow(
+            retriever=DocumentFakeRetriever(),
+            reasoner=CapableSectionReasoner(),
+            external_research=True,
+        ).run(spec)
+        assert [section.section_id for section in trace.sections if section.section_id != "evidence"] == [expected]
+        assert trace.external_research_enabled is False
+
+
 def test_local_fallback_cannot_mark_long_consulting_report_ready():
     class EvidenceRetriever:
         def search(self, _query, k=6):
@@ -763,6 +810,38 @@ def test_citation_sentence_split_does_not_break_pdf_filename():
     sentences = cited_sentences("A supported statement uses the report evidence. [Strategy_Report.pdf p.12]")
     assert len(sentences) == 1
     assert "[Strategy_Report.pdf p.12]" in sentences[0]
+
+
+def test_citation_tokens_do_not_trigger_repeated_stem_or_gap_support_failure():
+    evidence = [
+        EvidenceChunk(chunk_id="p1", page=1, source="client.pdf", text="The source describes the customer proposition and service model."),
+        EvidenceChunk(chunk_id="p2", page=2, source="client.pdf", text="The source describes the product assortment and delivery experience."),
+        EvidenceChunk(chunk_id="p3", page=3, source="client.pdf", text="The source describes customer reviews and showroom support."),
+    ]
+    content = (
+        "The supplied material does not establish organisational structure or competitive market share. "
+        "[client.pdf p.1][client.pdf p.2][client.pdf p.3]"
+    )
+    assert internal_pipeline_language_issues(content) == []
+    assert citation_coverage_issues(content, evidence) == []
+
+
+def test_citation_support_accepts_extracted_text_paraphrase():
+    evidence = [
+        EvidenceChunk(
+            chunk_id="p4",
+            page=4,
+            source="client.pdf",
+            text="Products are organized by residential space and customer use case, with seasonal promotions.",
+        ),
+        EvidenceChunk(chunk_id="p5", page=5, source="client.pdf", text="The source lists customer support and delivery information."),
+        EvidenceChunk(chunk_id="p6", page=6, source="client.pdf", text="The source describes the product assortment."),
+    ]
+    content = (
+        "The customer-facing proposition uses space-based merchandising and seasonal offers to guide selection. "
+        "[client.pdf p.4][client.pdf p.5][client.pdf p.6]"
+    )
+    assert citation_coverage_issues(content, evidence) == []
 
 
 class FailsOnceQC:

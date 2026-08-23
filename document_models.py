@@ -263,6 +263,7 @@ class GeneratedSection(BaseModel):
     synthesis_model_used: bool = False
     synthesis_error: str | None = None
     synthesis_fallback: bool = False
+    latency_ms: int | None = None
     revised: bool = False
     revision_count: int = 0
 
@@ -307,4 +308,7 @@ class DocumentTrace(BaseModel):
     target_word_count: int | None = None
     synthesis_engine: str = ""
     synthesis_model: str | None = None
+    smoke_test_mode: bool = False
+    smoke_test_sections: list[str] = Field(default_factory=list)
+    external_research_enabled: bool | None = None
     website_report: dict[str, object] | None = None

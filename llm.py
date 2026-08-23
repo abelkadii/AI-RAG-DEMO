@@ -26,6 +26,7 @@ class OpenAIReasoner:
         self.selection_reason = "OPENAI_API_KEY configured and LLM_MODE permits OpenAIReasoner."
         self.section_analysis_max_attempts = 2
         self.max_json_tokens = int(os.getenv("OPENAI_JSON_MAX_TOKENS", "900"))
+        self.section_analysis_max_tokens = max(self.max_json_tokens, 2400)
         self.max_answer_tokens = int(os.getenv("OPENAI_ANSWER_MAX_TOKENS", "900"))
         self.client = OpenAI(
             api_key=os.environ["OPENAI_API_KEY"],
@@ -42,13 +43,22 @@ class OpenAIReasoner:
             return {}
         return {"temperature": 0}
 
-    def _json(self, system: str, payload: dict, schema: type, *, max_attempts: int = 3):
+    def _json(
+        self,
+        system: str,
+        payload: dict,
+        schema: type,
+        *,
+        max_attempts: int = 3,
+        token_limit: int | None = None,
+    ):
         last_error: Exception | None = None
         self.last_structured_normalized = False
         self.last_structured_repair_retry = False
+        self.last_structured_error = None
         for attempt in range(max(1, max_attempts)):
             try:
-                token_limit = getattr(self, "max_json_tokens", 900)
+                token_limit = token_limit or getattr(self, "max_json_tokens", 900)
                 if self.model.startswith("gpt-5"):
                     token_limit = max(token_limit, 1200) + (attempt * 600)
                 response = self.client.chat.completions.create(
@@ -74,6 +84,7 @@ class OpenAIReasoner:
                 return schema.model_validate(raw_payload)
             except (ValidationError, json.JSONDecodeError, ValueError, TypeError, KeyError, IndexError) as error:
                 last_error = error
+                self.last_structured_error = f"{type(error).__name__}: {error}"
                 if attempt + 1 < max_attempts:
                     self.last_structured_repair_retry = True
                     system = (
