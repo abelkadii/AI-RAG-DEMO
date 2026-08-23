@@ -22,7 +22,8 @@ class OpenAIReasoner:
     def __init__(self) -> None:
         from openai import OpenAI
 
-        self.model = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
+        self.model = os.getenv("OPENAI_CHAT_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
+        self.selection_reason = "OPENAI_API_KEY configured and LLM_MODE permits OpenAIReasoner."
         self.max_json_tokens = int(os.getenv("OPENAI_JSON_MAX_TOKENS", "900"))
         self.max_answer_tokens = int(os.getenv("OPENAI_ANSWER_MAX_TOKENS", "900"))
         self.client = OpenAI(
@@ -272,6 +273,9 @@ def _concept_label(concept: str) -> str:
 class LocalReasoner:
     """Transparent heuristic fallback. It plans by uncovered question concepts."""
 
+    def __init__(self, selection_reason: str | None = None) -> None:
+        self.selection_reason = selection_reason or "OpenAIReasoner was not configured."
+
     def _evidence_hits(self, state: AgentState, concept: str) -> list[EvidenceChunk]:
         terms = CONCEPTS.get(concept, (concept,))
         expected_section = CONCEPT_SECTIONS.get(concept)
@@ -498,10 +502,19 @@ GENERIC_STOP_TERMS = {
 
 
 def configured_reasoner() -> Reasoner:
-    mode = os.getenv("LLM_MODE", "auto").lower()
-    if mode != "local" and os.getenv("OPENAI_API_KEY"):
+    mode = os.getenv("LLM_MODE", "auto").strip().lower()
+    key_configured = bool(os.getenv("OPENAI_API_KEY", "").strip())
+    model = os.getenv("OPENAI_CHAT_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
+    if mode == "local":
+        return LocalReasoner(f"LLM_MODE=local explicitly selected the deterministic fallback (model {model}).")
+    if not key_configured:
+        return LocalReasoner("OPENAI_API_KEY is not configured in the environment or Streamlit secrets.")
+    try:
         return OpenAIReasoner()
-    return LocalReasoner()
+    except Exception as error:
+        # Keep the app usable, but retain a safe diagnostic for the live feed;
+        # never include credential values in the message.
+        return LocalReasoner(f"OpenAIReasoner initialization failed: {type(error).__name__}.")
 
 
 def _evidence_payload(chunk: EvidenceChunk, limit: int) -> dict:

@@ -1,5 +1,5 @@
 from agent import Agent
-from llm import LocalReasoner, OpenAIReasoner
+from llm import LocalReasoner, OpenAIReasoner, configured_reasoner
 from models import AgentState, EvidenceChunk, EvidenceAssessment, SearchDecision
 
 
@@ -21,6 +21,22 @@ class MultiPillarRetriever:
         if "security" in query.lower():
             return [EvidenceChunk(chunk_id="security", page=30, section="Security", text="Identity and access management, data protection, infrastructure security, logging, and monitoring protect workloads.", score=0.8)]
         return [EvidenceChunk(chunk_id="reliability", page=10, section="Reliability", text="Fault isolated boundaries limit failures. Test recovery and disaster recovery plans.", score=0.8)]
+
+
+def test_configured_reasoner_exposes_safe_selection_diagnostics_and_model_alias(monkeypatch):
+    monkeypatch.setenv("LLM_MODE", "local")
+    monkeypatch.setenv("OPENAI_API_KEY", "configured-but-not-used")
+    local = configured_reasoner()
+    assert isinstance(local, LocalReasoner)
+    assert "LLM_MODE=local" in local.selection_reason
+
+    monkeypatch.setenv("LLM_MODE", "auto")
+    monkeypatch.delenv("OPENAI_CHAT_MODEL", raising=False)
+    monkeypatch.setenv("OPENAI_MODEL", "alias-model")
+    openai_reasoner = configured_reasoner()
+    assert isinstance(openai_reasoner, OpenAIReasoner)
+    assert openai_reasoner.model == "alias-model"
+    assert "OPENAI_API_KEY configured" in openai_reasoner.selection_reason
 
 
 class EmptyRetriever:

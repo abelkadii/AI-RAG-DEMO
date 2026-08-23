@@ -12,7 +12,14 @@ from dotenv import load_dotenv
 from agent import Agent
 from document_export import docx_bytes, markdown_bytes, pdf_bytes
 from document_models import DocumentSpec, DocumentTrace
-from document_workflow import DEFAULT_BRIEF, DEPTH_PROFILES, DocumentWorkflow, explicit_word_count
+from document_workflow import (
+    DEFAULT_BRIEF,
+    DEPTH_PROFILES,
+    DocumentWorkflow,
+    curriculum_strategy_mismatch,
+    effective_deliverable_type,
+    explicit_word_count,
+)
 from llm import configured_reasoner
 from models import AgentTrace, EvidenceChunk, IterationTrace
 from retriever import Retriever
@@ -33,11 +40,14 @@ MAX_AUDIENCE_LENGTH = 140
 
 
 def configure_credentials() -> None:
-    load_dotenv(override=True)
+    # Local .env is a development convenience; deployed Streamlit secrets and
+    # already-set environment variables must take precedence.
+    load_dotenv(override=False)
     for key in (
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
         "OPENAI_CHAT_MODEL",
+        "OPENAI_MODEL",
         "OPENAI_JSON_MAX_TOKENS",
         "OPENAI_ANSWER_MAX_TOKENS",
         "LLM_MODE",
@@ -49,7 +59,7 @@ def configure_credentials() -> None:
             secret_value = st.secrets.get(key)
         except Exception:
             secret_value = None
-        if secret_value:
+        if secret_value is not None and str(secret_value).strip():
             os.environ[key] = str(secret_value)
 
 
@@ -452,6 +462,14 @@ def document_studio() -> None:
                     index=1,
                     help="Depth controls length independently of deliverable type.",
                 )
+            effective_type_preview = effective_deliverable_type(deliverable_type, brief)
+            if curriculum_strategy_mismatch(brief, deliverable_type):
+                st.warning(
+                    "The brief strongly indicates a Consulting Assessment, but Curriculum / Teaching Material is selected. "
+                    "The run will use Consulting Assessment to prevent an incompatible plan."
+                )
+            elif effective_type_preview != deliverable_type:
+                st.caption(f"Effective type: {effective_type_preview}")
             requested_words = explicit_word_count(brief)
             if requested_words:
                 st.caption(f"Explicit request detected: approximately {requested_words:,} words (overrides depth).")
@@ -537,7 +555,6 @@ def document_studio() -> None:
             *(f"Reference precedent: {name}" for name in reference_names),
             *(f"Client source: {name}" for name in client_names),
             *( [f"Client website: {website_url.strip()}"] if source_kind == "uploaded" and website_url.strip() else [] ),
-            f"Deliverable type: {deliverable_type}",
             "Starting evidence-grounded document workflow",
         ]
         if website_notice:

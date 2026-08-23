@@ -7,6 +7,7 @@ from document_workflow import (
     DEFAULT_BRIEF,
     DocumentWorkflow,
     citation_coverage_issues,
+    curriculum_strategy_mismatch,
     resolve_deliverable_type,
     serializable_evidence,
     DEPTH_PROFILES,
@@ -68,6 +69,23 @@ def test_website_report_payload_tolerates_cached_legacy_report_fields():
     assert payload["error_type"] is None
     assert payload["error_message"] is None
     assert payload["homepage_error"] is None
+
+
+def test_section_analysis_accepts_equivalent_model_labels():
+    analysis = SectionAnalysis.model_validate(
+        {
+            "section_id": "executive-summary",
+            "known_facts": [{"statement": "A phased engagement is requested.", "supporting_evidence_ids": ["E1"]}],
+            "evidence_claims": [{"claim": "The source identifies a roadmap.", "evidence_ids": ["E1"]}],
+            "analytical_inferences": [{"inference": "Sequencing should be validated."}],
+            "hypotheses": [{"hypothesis": "A phased model may reduce execution risk."}],
+        }
+    )
+    assert analysis.known_facts[0].text == "A phased engagement is requested."
+    assert analysis.known_facts[0].evidence_ids == ["E1"]
+    assert analysis.evidence_claims[0].text == "The source identifies a roadmap."
+    assert analysis.analytical_inferences == ["Sequencing should be validated."]
+    assert analysis.hypotheses == ["A phased model may reduce execution risk."]
 
 
 def make_workflow(**kwargs):
@@ -229,6 +247,51 @@ def test_strong_strategy_intent_overrides_accidental_briefly_prefix_in_auto_mode
         deliverable_type="Auto",
     )
     assert resolve_deliverable_type(spec) == "Consulting Assessment"
+
+
+def test_charley_strategy_scope_overrides_stale_curriculum_selection():
+    brief = """Create a business strategy report for Speckled Space.
+
+Stage 1 — Business Diagnostic & Competitive Landscape
+1.1 Organisational Health Check & Operating Model Review
+1.2 Competitive Landscape & Market Positioning Assessment
+
+Stage 2 — Strategic Planning & Business Development
+2.1 Business Model & Financial Strategy
+2.2 Workforce Planning
+2.3 Brand & Marketing Strategy
+2.4 Internationalisation
+2.5 AI Adoption Roadmap
+2.6 Strategic Roadmap and KPI framework
+
+Stage 3 — Implementation Planning and Knowledge Transfer"""
+    spec = DocumentSpec(
+        title="Evidence-Grounded Report",
+        client_brief=brief,
+        source_kind="uploaded",
+        deliverable_type="Curriculum / Teaching Material",
+        company_website="https://speckledspace.com/",
+    )
+
+    assert curriculum_strategy_mismatch(brief, spec.deliverable_type)
+    assert resolve_deliverable_type(spec) == "Consulting Assessment"
+    plan = make_workflow().plan(spec, [])
+    assert plan.title == "Speckled Space Business Strategy Report"
+    assert plan.deliverable_type == "Consulting Assessment"
+    titles = " ".join(section.title for section in plan.sections)
+    assert "Course Overview" not in titles
+    assert "Foundations and Definitions" not in titles
+    assert "Stage 1" in titles and "Stage 2" in titles and "Stage 3" in titles
+
+    trace = DocumentWorkflow(
+        retriever=DocumentFakeRetriever(),
+        reasoner=LocalReasoner(),
+        max_section_iterations=1,
+        external_research=False,
+    ).run(spec)
+    assert trace.plan.deliverable_type == "Consulting Assessment"
+    assert "A second way to understand" not in trace.final_markdown
+    assert "This is part of course overview" not in trace.final_markdown.lower()
 
 
 def test_summary_brief_overrides_mismatched_manual_curriculum_type():

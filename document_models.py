@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 
 from models import AgentTrace, CitationValidation, EvidenceChunk
 
@@ -64,8 +64,11 @@ class DocumentSectionPlan(BaseModel):
 
 
 class SectionEvidenceClaim(BaseModel):
-    text: str
-    evidence_ids: list[str] = Field(default_factory=list)
+    text: str = Field(validation_alias=AliasChoices("text", "claim", "statement", "fact", "finding"))
+    evidence_ids: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("evidence_ids", "supporting_evidence_ids", "source_ids"),
+    )
 
 
 class SectionAnalysis(BaseModel):
@@ -85,6 +88,48 @@ class SectionAnalysis(BaseModel):
     recommended_analysis: list[str] = Field(default_factory=list)
     evidence_ids: list[str] = Field(default_factory=list)
     planned_paragraphs: list[str] = Field(default_factory=list)
+
+    @field_validator(
+        "analytical_inferences",
+        "hypotheses",
+        "recommendations",
+        "data_gaps",
+        "observable_context",
+        "recommended_analysis",
+        "planned_paragraphs",
+        mode="before",
+    )
+    @classmethod
+    def normalize_text_items(cls, value):
+        """Accept equivalent structured labels returned by chat models."""
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, dict):
+            value = [value]
+        normalized: list[str] = []
+        labels = (
+            "text",
+            "inference",
+            "hypothesis",
+            "recommendation",
+            "gap",
+            "data_gap",
+            "context",
+            "analysis",
+            "paragraph",
+            "statement",
+        )
+        for item in value:
+            if isinstance(item, str):
+                normalized.append(item)
+                continue
+            if isinstance(item, dict):
+                text = next((item.get(label) for label in labels if item.get(label)), None)
+                if text is not None:
+                    normalized.append(str(text))
+        return normalized
 
 
 class SectionDraft(BaseModel):

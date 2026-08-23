@@ -545,12 +545,19 @@ class DocumentWorkflow:
         survey = self._survey_source(spec)
         self._event(on_event, "Planning document")
         plan = self.plan(spec, survey)
+        if spec.source_kind == "uploaded":
+            self._event(on_event, f"Requested type: {spec.deliverable_type}")
+            self._event(on_event, f"Effective type: {plan.deliverable_type}")
         synthesis_engine = getattr(self.section_writer, "synthesis", None)
         if spec.source_kind == "uploaded":
             if synthesis_engine is not None and synthesis_engine.capable:
                 self._event(on_event, f"Synthesis engine: OpenAI ({getattr(self.reasoner, 'model', 'configured model')})")
             else:
-                self._event(on_event, "Synthesis engine: local fallback — full professional synthesis unavailable")
+                self._event(on_event, "Synthesis engine: local fallback")
+                self._event(on_event, "Professional long-form synthesis disabled")
+                selection_reason = getattr(self.reasoner, "selection_reason", None)
+                if selection_reason:
+                    self._event(on_event, f"OpenAIReasoner not selected: {selection_reason}")
             if plan.deliverable_type == "Consulting Assessment":
                 self._event(on_event, f"External research: {'enabled' if self.external_research_enabled(spec) else 'disabled'}")
         generated_sections: list[GeneratedSection] = []
@@ -1586,31 +1593,35 @@ def section_requirements(section: DocumentSectionPlan) -> list[str]:
 
 
 def resolve_deliverable_type(spec: DocumentSpec) -> str:
-    brief = spec.client_brief.lower()
+    return effective_deliverable_type(spec.deliverable_type, spec.client_brief)
+
+
+def effective_deliverable_type(selected_type: str, brief: str) -> str:
+    """Resolve the type used for planning, including a stale-UI safeguard."""
+    brief = brief or ""
     strategy_intent = has_strong_strategy_intent(brief)
     # A long-form strategy request dominates an accidental leading phrase such
-    # as "explain briefly".  Explicit controls still win when the user chose a
-    # concrete non-Auto type; the legacy weak-summary override is retained only
-    # for compatibility with older callers that passed Curriculum with a pure
-    # summary brief.
-    if spec.deliverable_type != "Auto":
+    # as "explain briefly".  Explicit controls still win except for the one
+    # unsafe stale-state combination handled by curriculum_strategy_mismatch.
+    if selected_type != "Auto":
+        if strategy_intent and curriculum_strategy_mismatch(brief, selected_type):
+            return "Consulting Assessment"
         if strategy_intent:
-            return spec.deliverable_type
-        if has_strong_summary_intent(spec.client_brief):
+            return selected_type
+        if has_strong_summary_intent(brief):
             return "Summary / Brief"
-        return spec.deliverable_type
+        return selected_type
     if strategy_intent:
         return "Consulting Assessment"
-    if has_strong_summary_intent(spec.client_brief):
+    if has_strong_summary_intent(brief):
         return "Summary / Brief"
-    if any(term in brief for term in ("teach", "lesson", "curriculum", "student", "learning objective", "classroom")):
+    lower = brief.lower()
+    if any(term in lower for term in ("teach", "lesson", "curriculum", "student", "learning objective", "classroom")):
         return "Curriculum / Teaching Material"
-    if any(term in brief for term in ("risk", "remediation", "roadmap", "90-day", "recommend", "assessment", "action plan", "strategy report", "scope of work", "stage 1", "diagnostic")):
+    if any(term in lower for term in ("risk", "remediation", "roadmap", "90-day", "recommend", "assessment", "action plan", "strategy report", "scope of work", "stage 1", "diagnostic")):
         return "Consulting Assessment"
-    if any(term in brief for term in ("methodology", "findings", "study", "research", "results", "literature")):
+    if any(term in lower for term in ("methodology", "findings", "study", "research", "results", "literature")):
         return "Research Report"
-    if has_strong_summary_intent(spec.client_brief):
-        return "Summary / Brief"
     return "Custom"
 
 
@@ -1634,6 +1645,38 @@ def has_strong_strategy_intent(brief: str) -> bool:
     )
     numbered_items = len(extract_scope_items(brief))
     return numbered_items >= 3 or any(signal in lower for signal in signals)
+
+
+def curriculum_strategy_mismatch(brief: str, selected_type: str) -> bool:
+    """Detect the specific stale Curriculum selection seen in the client smoke test."""
+    return (
+        selected_type == "Curriculum / Teaching Material"
+        and has_multi_stage_business_scope(brief)
+        and has_strong_business_strategy_signals(brief)
+    )
+
+
+def has_multi_stage_business_scope(brief: str) -> bool:
+    stages = {match.group(1) for match in re.finditer(r"\bstage\s+(\d+)\b", (brief or "").lower())}
+    return len(stages) >= 2 and len(extract_scope_items(brief)) >= 3
+
+
+def has_strong_business_strategy_signals(brief: str) -> bool:
+    lower = (brief or "").lower()
+    signals = (
+        "business",
+        "strategy",
+        "roadmap",
+        "kpi",
+        "competitive",
+        "financial",
+        "market",
+        "workforce",
+        "international",
+        "implementation",
+        "operating model",
+    )
+    return sum(signal in lower for signal in signals) >= 3
 
 
 def has_strong_summary_intent(brief: str) -> bool:
