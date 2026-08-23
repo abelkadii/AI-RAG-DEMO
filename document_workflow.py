@@ -609,7 +609,7 @@ class DocumentWorkflow:
         self._event(on_event, "Planning document")
         plan = self.plan(spec, survey)
         execution_plan, smoke_test_mode = self.execution_plan(plan, spec, on_event)
-        if survey and self.use_dedicated_consulting_path(spec, plan, smoke_test_mode):
+        if self.has_source_evidence(spec) and self.use_dedicated_consulting_path(spec, plan, smoke_test_mode):
             return self.run_consulting_report(spec, plan, survey, started, on_event)
         if spec.source_kind == "uploaded":
             self._event(on_event, f"Requested type: {spec.deliverable_type}")
@@ -831,6 +831,12 @@ class DocumentWorkflow:
             and plan.deliverable_type == "Consulting Assessment"
             and not smoke_test_mode
         )
+
+    def has_source_evidence(self, spec: DocumentSpec) -> bool:
+        if spec.source_kind != "uploaded":
+            return False
+        chunks = getattr(self.retriever, "chunks", getattr(getattr(self.retriever, "store", None), "chunks", []))
+        return any((chunk.source or "").strip().lower() not in {"client brief", "requirements"} for chunk in chunks)
 
     def run_consulting_report(
         self,

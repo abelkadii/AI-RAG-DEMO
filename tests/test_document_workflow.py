@@ -51,6 +51,16 @@ from streamlit_app import MAX_BRIEF_LENGTH, default_client_brief, website_report
 class DocumentFakeRetriever:
     def __init__(self):
         self.calls = []
+        self.chunks = [
+            EvidenceChunk(
+                chunk_id="sample-1",
+                page=1,
+                source="Website: speckledspace.com",
+                section="/",
+                text="Speckled Space presents home decor products, delivery support, customer reviews, pricing, and showroom details.",
+                score=0.9,
+            )
+        ]
 
     def search(self, query, k=6):
         self.calls.append(query)
@@ -62,6 +72,27 @@ class DocumentFakeRetriever:
         if "pillar" in lower or "overview" in lower or "framework" in lower:
             return [EvidenceChunk(chunk_id=f"overview-{len(self.calls)}", page=8, section="Overview", text="The AWS Well-Architected Framework provides best practices to evaluate architectures and is based on six pillars.", score=0.9)]
         return [EvidenceChunk(chunk_id=f"reliability-{len(self.calls)}", page=10, section="Reliability", text="Fault isolated boundaries limit failures. Test recovery and disaster recovery plans.", score=0.9)]
+
+
+class WebsiteChunksButEmptySurveyRetriever(DocumentFakeRetriever):
+    def __init__(self):
+        super().__init__()
+        self.chunks = [
+            EvidenceChunk(
+                chunk_id="website-1",
+                page=1,
+                source="Website: speckledspace.com",
+                section="/",
+                text="Speckled Space presents home decor products, showroom contact details, delivery support, and customer reviews.",
+                score=0.9,
+            )
+        ]
+
+    def search(self, query, k=6):
+        self.calls.append(query)
+        if any(term in query.lower() for term in ("document title", "introduction", "conclusion", "major recurring", "representative source")):
+            return []
+        return self.chunks[:k]
 
 
 def test_website_report_payload_tolerates_cached_legacy_report_fields():
@@ -697,6 +728,46 @@ Stage 3 - Implementation Planning and Knowledge Transfer
     assert "Knowledge Base" not in trace.final_markdown
     assert "Client Brief" not in trace.final_markdown
     assert "E1" not in trace.final_markdown
+
+
+def test_website_only_consulting_uses_dedicated_path_even_when_survey_empty():
+    brief = """Create a business strategy report for Speckled Space.
+
+Stage 1 - Business Diagnostic & Competitive Landscape
+1.1 Organisational Health Check
+1.2 Competitive Landscape
+Stage 2 - Strategic Planning & Business Development
+2.1 Market & Customer Intelligence
+2.2 Business Model & Financial Strategy
+2.3 Workforce Planning
+2.4 Brand & Marketing Strategy
+2.5 Internationalisation
+2.6 AI Integration
+2.7 Strategic Roadmap
+Stage 3 - Training, Implementation Planning & Knowledge Transfer
+3.1 Strategic Frameworks
+3.2 AI-Enabled Process
+3.3 Playbooks"""
+    events = []
+    trace = DocumentWorkflow(
+        retriever=WebsiteChunksButEmptySurveyRetriever(),
+        reasoner=BatchConsultingReasoner(),
+        external_research=False,
+    ).run(
+        DocumentSpec(
+            client_brief=brief,
+            source_kind="uploaded",
+            deliverable_type="Auto",
+            company_website="https://speckledspace.com/",
+        ),
+        events.append,
+    )
+
+    assert trace.analysis_llm_calls == 1
+    assert trace.synthesis_llm_calls <= 4
+    assert trace.total_research_iterations == 0
+    assert "Building strategy analysis" in events
+    assert not any(event.startswith("Researching Executive Summary") for event in events)
 
 
 def test_local_fallback_cannot_mark_long_consulting_report_ready():
