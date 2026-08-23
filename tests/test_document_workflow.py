@@ -208,6 +208,18 @@ def test_serializable_evidence_handles_hot_reload_model_identity():
     assert serialized[0]["source"] == "doc.pdf"
 
 
+def test_document_plan_serializes_source_survey_evidence_for_streamlit_reruns():
+    spec = DocumentSpec(
+        client_brief="what does this talk about, explain briefly",
+        source_kind="uploaded",
+        target_depth="Standard",
+    )
+    survey = [EvidenceChunk(chunk_id="survey-1", page=2, text="The source introduces its subject.", source="doc.pdf")]
+    plan = make_workflow().plan(spec, survey)
+    assert plan.source_survey[0].chunk_id == "survey-1"
+    assert plan.model_dump()["source_survey"][0]["source"] == "doc.pdf"
+
+
 def test_uploaded_retrieval_diversification_limits_per_page_without_forcing_irrelevance():
     candidates = [
         EvidenceChunk(chunk_id=f"p1-{index}", page=1, source="doc.pdf", text=f"alpha topic detail {index}", score=1.0 - index * 0.01)

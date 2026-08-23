@@ -209,7 +209,7 @@ class DocumentWorkflow:
             deliverable_type="Consulting Assessment",
             target_depth=depth_label(spec),
             target_word_count=target_word_count(spec),
-            source_survey=survey or [],
+            source_survey=serializable_evidence(survey or []),
             source_topics=source_topic_labels(survey or []),
             sections=[
                 DocumentSectionPlan(
@@ -328,7 +328,7 @@ class DocumentWorkflow:
             deliverable_type=deliverable_type,
             target_depth=depth,
             target_word_count=target_word_count(spec),
-            source_survey=survey,
+            source_survey=serializable_evidence(survey),
             source_topics=topic_labels,
             sections=sections,
         )
