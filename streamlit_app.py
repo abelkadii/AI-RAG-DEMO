@@ -64,13 +64,28 @@ def run_agent(question: str) -> AgentTrace:
     return trace
 
 
-def run_document(spec: DocumentSpec, retriever, status_box=None, reference_retriever=None) -> DocumentTrace:
+def run_document(spec: DocumentSpec, retriever, status_box=None, reference_retriever=None, website_report=None) -> DocumentTrace:
     def on_event(message: str) -> None:
         if status_box:
             status_box(message)
 
     workflow = DocumentWorkflow(retriever, configured_reasoner(), max_section_iterations=2, reference_retriever=reference_retriever)
     trace = workflow.run(spec, on_event)
+    if website_report is not None:
+        trace.website_report = {
+            "requested_url": website_report.requested_url,
+            "resolved_url": website_report.resolved_url,
+            "status_code": website_report.status_code,
+            "pages_discovered": website_report.pages_discovered,
+            "pages_fetched": website_report.pages_fetched,
+            "pages_rejected": website_report.pages_rejected,
+            "indexed_pages": website_report.indexed_pages,
+            "character_counts": website_report.character_counts,
+            "errors": website_report.errors,
+            "error_type": website_report.error_type,
+            "error_message": website_report.error_message,
+            "homepage_error": website_report.homepage_error,
+        }
     on_event("Rendering DOCX/PDF")
     # Render once during the run so the demo proves the deliverable is
     # downloadable, while the bytes remain generated on demand below.
@@ -528,6 +543,8 @@ def document_studio() -> None:
             )
             if website_report.pages_rejected:
                 events.append("Website rejected: " + "; ".join(website_report.pages_rejected[:3]))
+            if website_report.errors:
+                events.append("Website error: " + "; ".join(website_report.errors[:2]))
         feed_placeholder.markdown(render_terminal(events), unsafe_allow_html=True)
 
         def on_feed(message: str) -> None:
@@ -536,7 +553,7 @@ def document_studio() -> None:
 
         with st.spinner("Generating report — watch the live process feed below."):
             try:
-                trace = run_document(spec, retriever, on_feed, reference_retriever=reference_retriever)
+                trace = run_document(spec, retriever, on_feed, reference_retriever=reference_retriever, website_report=website_report)
             except Exception as error:
                 events.append(f"Document generation failed: {error}")
                 feed_placeholder.markdown(render_terminal(events, state="error"), unsafe_allow_html=True)

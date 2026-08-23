@@ -1,5 +1,7 @@
+from pathlib import Path
+
 from document_export import docx_bytes, markdown_bytes, pdf_bytes
-from document_models import DocumentSectionPlan, DocumentSpec, GeneratedSection, SectionQC
+from document_models import DocumentSectionPlan, DocumentSpec, GeneratedSection, SectionAnalysis, SectionDraft, SectionQC
 from document_workflow import (
     DEFAULT_BRIEF,
     DocumentWorkflow,
@@ -17,11 +19,15 @@ from document_workflow import (
     build_long_form_section,
     cited_sentences,
     replace_evidence_ids,
+    SectionSynthesisEngine,
+    cross_section_duplication,
+    requirements_only_section,
 )
 from llm import LocalReasoner
 from models import AgentTrace, EvidenceChunk
-from uploaded_corpus import clean_uploaded_text, diversify_results, extract_pdf_bytes
+from uploaded_corpus import EmptyRetriever, clean_uploaded_text, diversify_results, extract_pdf_bytes
 from website_context import fetch_website_evidence
+import website_context
 from streamlit_app import MAX_BRIEF_LENGTH, default_client_brief
 
 
@@ -327,6 +333,183 @@ def test_website_context_rejects_unbounded_or_insecure_urls_gracefully():
     chunks, notice = fetch_website_evidence("http://example.com")
     assert chunks == []
     assert notice
+
+
+def test_shopify_like_website_ingestion_returns_chunks(monkeypatch):
+    fixture = (Path(__file__).parent / "fixtures" / "speckledspace_home.html").read_bytes()
+
+    class Response:
+        status = 200
+
+        def __init__(self, url):
+            self.url = url
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def geturl(self):
+            return self.url
+
+        def read(self, _limit):
+            return fixture
+
+    monkeypatch.setattr(website_context, "urlopen", lambda request, timeout=8: Response(request.full_url))
+    chunks, notice, report = fetch_website_evidence("https://speckledspace.test/", max_pages=5, return_report=True)
+    assert chunks
+    assert notice is None
+    assert len(report.indexed_pages) >= 1
+    assert any("free delivery" in chunk.text.lower() for chunk in chunks)
+    assert report.character_counts
+
+
+def test_redirected_website_ingestion_returns_chunks(monkeypatch):
+    fixture = (Path(__file__).parent / "fixtures" / "speckledspace_home.html").read_bytes()
+
+    class Response:
+        status = 200
+
+        def __init__(self, url):
+            self.url = url
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def geturl(self):
+            return "https://www.speckledspace.test/" if self.url == "https://speckledspace.test/" else self.url
+
+        def read(self, _limit):
+            return fixture
+
+    monkeypatch.setattr(website_context, "urlopen", lambda request, timeout=8: Response(request.full_url))
+    chunks, notice, report = fetch_website_evidence("http://speckledspace.test", max_pages=5, return_report=True)
+    assert chunks
+    assert notice is None
+    assert report.resolved_url == "https://www.speckledspace.test/"
+    assert all(chunk.source == "Website: speckledspace.test" for chunk in chunks)
+
+
+def test_requested_website_failure_prevents_deliverable_ready():
+    spec = DocumentSpec(
+        title="Speckled Space Business Strategy Report",
+        client_brief="Create a business strategy report with market analysis and recommendations.",
+        source_kind="uploaded",
+        deliverable_type="Consulting Assessment",
+        company_website="https://speckledspace.test/",
+    )
+    trace = DocumentWorkflow(
+        retriever=EmptyRetriever(),
+        reasoner=LocalReasoner(),
+        external_research=False,
+    ).run(spec)
+    assert not trace.final_qc.passed
+    assert "Requested website evidence could not be acquired." in trace.final_qc.major_issues
+
+
+def test_consulting_report_with_zero_total_evidence_fails_final_qc():
+    spec = DocumentSpec(
+        title="Client Strategy Report",
+        client_brief="Create a strategy assessment with recommendations and a roadmap.",
+        source_kind="uploaded",
+        deliverable_type="Consulting Assessment",
+    )
+    trace = DocumentWorkflow(retriever=EmptyRetriever(), reasoner=LocalReasoner(), external_research=False).run(spec)
+    assert not trace.final_qc.passed
+    assert "No factual client or public evidence was successfully acquired." in trace.final_qc.major_issues
+
+
+class CapableSectionReasoner(LocalReasoner):
+    def __init__(self, *, fail: bool = False):
+        self.calls = []
+        self.model = "test-model"
+        self.fail = fail
+
+    def _json(self, _system, _payload, schema):
+        self.calls.append(schema.__name__)
+        if self.fail:
+            raise RuntimeError("synthetic synthesis outage")
+        if schema is SectionAnalysis:
+            return SectionAnalysis(
+                section_id="analysis",
+                section_mode="diagnostic",
+                objective="Assess the workstream.",
+                observable_context=["The supplied public material is limited."],
+                analytical_inferences=["Compare the relevant decision criteria."],
+                hypotheses=["The internal condition remains a hypothesis."],
+                data_gaps=["Internal baseline and performance data are required."],
+                recommended_analysis=["Test the hypothesis against the baseline."],
+                planned_paragraphs=["context", "analysis", "data gaps"],
+            )
+        return SectionDraft(markdown="Assess the decision criteria and state what internal data is required before reaching a company-specific conclusion.")
+
+
+def test_empty_section_evidence_still_uses_capable_synthesis_model():
+    reasoner = CapableSectionReasoner()
+    spec = DocumentSpec(
+        client_brief="Create a strategy assessment.",
+        source_kind="uploaded",
+        deliverable_type="Consulting Assessment",
+    )
+    trace = DocumentWorkflow(retriever=EmptyRetriever(), reasoner=reasoner, external_research=False).run(spec)
+    assert "SectionAnalysis" in reasoner.calls
+    assert "SectionDraft" in reasoner.calls
+    assert any(section.analysis_model_used and section.synthesis_model_used for section in trace.sections if section.section_id != "evidence")
+
+
+def test_local_fallback_cannot_mark_long_consulting_report_ready():
+    class EvidenceRetriever:
+        def search(self, _query, k=6):
+            return [EvidenceChunk(chunk_id="client-1", page=1, source="client.pdf", text="Market strategy analysis covers customer demand, financial context, capabilities, roadmap, and recommendations.", score=0.9)]
+
+    spec = DocumentSpec(
+        client_brief="Create a business strategy report with market analysis and recommendations.",
+        source_kind="uploaded",
+        deliverable_type="Consulting Assessment",
+        target_depth="Standard",
+    )
+    trace = DocumentWorkflow(retriever=EvidenceRetriever(), reasoner=LocalReasoner(), external_research=False).run(spec)
+    assert not trace.final_qc.passed
+    assert any("fallback" in issue.lower() for issue in trace.final_qc.major_issues)
+
+
+def test_requirements_only_fallback_is_bounded_not_word_padded():
+    spec = DocumentSpec(client_brief="Create a detailed strategy report.", source_kind="uploaded", deliverable_type="Consulting Assessment")
+    section = DocumentSectionPlan(section_id="market", title="Market Analysis", objective="Assess customer segments and market sizing.", approximate_word_budget=5000)
+    content = requirements_only_section(spec, section)
+    assert len(content.split()) <= 180
+    assert "The market analysis workstream is part of" not in content
+
+
+def test_cross_section_duplication_checks_no_evidence_sections():
+    sections = [
+        GeneratedSection(section_id=f"s{i}", title=f"Section {i}", objective="Assess the workstream.", content_markdown="The market workstream is part of the requested engagement and should assess the available evidence.", evidence=[], research_trace=AgentTrace(question="q"), qc=SectionQC(passed=True))
+        for i in range(1, 4)
+    ]
+    assert cross_section_duplication(sections)
+
+
+def test_synthesis_failure_is_exposed_in_trace():
+    spec = DocumentSpec(client_brief="Create a strategy assessment.", source_kind="uploaded", deliverable_type="Consulting Assessment")
+    trace = DocumentWorkflow(retriever=EmptyRetriever(), reasoner=CapableSectionReasoner(fail=True), external_research=False).run(spec)
+    assert any(section.synthesis_error for section in trace.sections if section.section_id != "evidence")
+
+
+def test_external_research_limitation_appears_once():
+    spec = DocumentSpec(
+        client_brief="Create a business strategy report.\nStage 1 - Competitive Landscape and Market Analysis.\nStage 2 - Planning.\nStage 3 - Training.",
+        source_kind="uploaded",
+        deliverable_type="Consulting Assessment",
+    )
+    trace = DocumentWorkflow(retriever=EmptyRetriever(), reasoner=LocalReasoner(), external_research=False).run(spec)
+    marker = "Public competitor, market, and internationalisation sources were not available"
+    applicable = [section for section in trace.sections if "market" in section.title.lower() or "competitive" in section.objective.lower()]
+    assert applicable
+    assert all(section.content_markdown.count(marker) <= 1 for section in applicable)
 
 
 def test_stage_scope_is_preserved_in_strategy_plan():

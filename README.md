@@ -93,7 +93,7 @@ Optional:
 - `OPENAI_ANSWER_MAX_TOKENS`
 - `DEMO_ACCESS_CODE`
 - `LLM_MODE=local` to force the deterministic fallback
-- `ENABLE_EXTERNAL_RESEARCH=1` to enable the bounded public-source research adapter for strategy sections
+- `ENABLE_EXTERNAL_RESEARCH=0` to disable the bounded public-source research adapter; uploaded Consulting Assessments enable it by default
 
 When no capable synthesis model is configured, Document Studio emits a bounded evidence summary or diagnostic data-gap analysis and marks requested depth limits for review; it does not pad the report with repeated fallback prose.
 

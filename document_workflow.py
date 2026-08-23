@@ -359,6 +359,7 @@ class DocumentWorkflow:
         qc_runner: QCRunner | None = None,
         reference_retriever=None,
         reference_profile: ReferenceReportProfile | None = None,
+        external_research: bool | None = None,
     ) -> None:
         self.retriever = retriever or Retriever()
         self.reasoner = reasoner or configured_reasoner()
@@ -368,6 +369,12 @@ class DocumentWorkflow:
         self.qc_runner = qc_runner or DeterministicSectionQC()
         self.reference_retriever = reference_retriever
         self.reference_profile = reference_profile
+        self.external_research = external_research
+
+    def external_research_enabled(self, spec: DocumentSpec) -> bool:
+        if self.external_research is not None:
+            return self.external_research
+        return spec.source_kind == "uploaded" and resolve_deliverable_type(spec) == "Consulting Assessment"
 
     def plan(self, spec: DocumentSpec, survey: list[EvidenceChunk] | None = None) -> DocumentPlan:
         if spec.source_kind == "uploaded":
@@ -539,8 +546,13 @@ class DocumentWorkflow:
         self._event(on_event, "Planning document")
         plan = self.plan(spec, survey)
         synthesis_engine = getattr(self.section_writer, "synthesis", None)
-        if spec.source_kind == "uploaded" and synthesis_engine is not None and not synthesis_engine.capable:
-            self._event(on_event, "Configured synthesis model unavailable; using a bounded evidence summary and marking depth limits for review.")
+        if spec.source_kind == "uploaded":
+            if synthesis_engine is not None and synthesis_engine.capable:
+                self._event(on_event, f"Synthesis engine: OpenAI ({getattr(self.reasoner, 'model', 'configured model')})")
+            else:
+                self._event(on_event, "Synthesis engine: local fallback — full professional synthesis unavailable")
+            if plan.deliverable_type == "Consulting Assessment":
+                self._event(on_event, f"External research: {'enabled' if self.external_research_enabled(spec) else 'disabled'}")
         generated_sections: list[GeneratedSection] = []
         prior_summaries: list[str] = []
         evidence_by_id: dict[str, EvidenceChunk] = {}
@@ -621,11 +633,20 @@ class DocumentWorkflow:
                 research_trace=research_trace,
                 qc=qc,
                 analysis=getattr(self.section_writer, "last_analysis", None),
+                analysis_model_used=getattr(getattr(self.section_writer, "synthesis", None), "last_analysis_model_used", False),
+                synthesis_model_used=getattr(getattr(self.section_writer, "synthesis", None), "last_synthesis_model_used", False),
+                synthesis_error=(
+                    getattr(getattr(self.section_writer, "synthesis", None), "last_synthesis_error", None)
+                    or getattr(getattr(self.section_writer, "synthesis", None), "last_analysis_error", None)
+                ),
+                synthesis_fallback=getattr(getattr(self.section_writer, "synthesis", None), "last_used_fallback", False),
                 revised=revised,
                 revision_count=revision_count,
             )
             generated_sections.append(generated)
             prior_summaries.append(summarize_section(content))
+            if generated.synthesis_error:
+                self._event(on_event, f"Synthesis fallback for {section_plan.title}: {generated.synthesis_error}")
             self._event(on_event, f"{section_plan.title} approved" if qc.passed else f"{section_plan.title} needs review")
 
         all_evidence = list(evidence_by_id.values())
@@ -642,7 +663,29 @@ class DocumentWorkflow:
                 if not section_plan or section_trace.section_id == "evidence" or not section_plan.approximate_word_budget:
                     continue
                 evidence = [EvidenceChunk.model_validate(item) if isinstance(item, dict) else item for item in section_trace.evidence]
-                repaired = build_long_form_section(spec, section_plan, evidence, prior_summaries)
+                repaired = section_trace.content_markdown
+                if (
+                    synthesis_engine is not None
+                    and synthesis_engine.capable
+                    and not section_trace.synthesis_fallback
+                    and section_trace.analysis is not None
+                ):
+                    candidate = synthesis_engine.synthesize(
+                        spec,
+                        plan,
+                        section_plan,
+                        section_trace.analysis,
+                        evidence,
+                        target_range=f"{max(180, round((section_plan.approximate_word_budget or 250) * 0.95))}-"
+                        f"{max(240, round((section_plan.approximate_word_budget or 250) * 1.35))} words",
+                        depth_instruction="Add substantive analysis only where it follows from the structured analysis; do not pad or repeat the section.",
+                    )
+                    if synthesis_engine.last_synthesis_model_used:
+                        repaired = candidate
+                        section_trace.synthesis_model_used = True
+                        section_trace.synthesis_error = synthesis_engine.last_synthesis_error
+                    elif synthesis_engine.last_synthesis_error:
+                        section_trace.synthesis_error = synthesis_engine.last_synthesis_error
                 repaired, _ = replace_evidence_ids(repaired, evidence)
                 if spec.source_kind == "uploaded":
                     disclosure = external_research_disclosure(section_plan, evidence)
@@ -691,6 +734,12 @@ class DocumentWorkflow:
             total_unique_cited_pages=len({(source, page) for source, page in citation_pairs(cleaned_markdown)}),
             final_word_count=count_report_words(cleaned_markdown),
             target_word_count=target_word_count(spec),
+            synthesis_engine=(
+                f"OpenAI ({getattr(self.reasoner, 'model', 'configured model')})"
+                if synthesis_engine is not None and synthesis_engine.capable
+                else "local fallback"
+            ),
+            synthesis_model=getattr(self.reasoner, "model", None) if synthesis_engine is not None and synthesis_engine.capable else None,
         )
 
     @staticmethod
@@ -751,7 +800,8 @@ class DocumentWorkflow:
                     gathered[chunk.chunk_id] = chunk
         if spec and spec.source_kind == "uploaded" and requires_external_research(section):
             external_chunks, external_report = research_public_sources(
-                queries_for_section(section.title, section.objective, section.questions)
+                queries_for_section(section.title, section.objective, section.questions),
+                enabled=self.external_research_enabled(spec) if spec else None,
             )
             if external_report.enabled:
                 self._event(on_event, external_report.notice)
@@ -765,8 +815,15 @@ class DocumentWorkflow:
             self.evidence_k,
             # Document Studio must not turn an unrelated top hit into a
             # factual section.  The legacy RAG Explorer can opt into the
-            # compatibility fallback by calling the helper directly.
-            allow_sparse_fallback=False,
+            # compatibility fallback by calling the helper directly.  The
+            # existing offline curriculum compatibility path also retains one
+            # source excerpt so its teaching-plan regression remains useful;
+            # consulting/strategy reports always stay strict.
+            allow_sparse_fallback=(
+                spec is not None
+                and resolve_deliverable_type(spec) == "Curriculum / Teaching Material"
+                and not getattr(getattr(self.section_writer, "synthesis", None), "capable", False)
+            ),
         )
         return filtered, merge_agent_traces(section.title, traces)
 
@@ -981,6 +1038,10 @@ def deterministic_section_analysis(
         hypotheses=hypotheses,
         recommendations=["Recommend only actions explicitly requested by the brief and supported by the supplied material."] if requests_actions(spec.client_brief) else [],
         data_gaps=gaps,
+        observable_context=["No direct source observation was retrieved for this workstream."] if not evidence else [],
+        recommended_analysis=[
+            "Assess the relevant baseline, decision criteria, and validation evidence before making a company-specific conclusion."
+        ],
         evidence_ids=[item for claim in claims for item in claim.evidence_ids],
         planned_paragraphs=["established observations", "interpretation and decision relevance", "data gaps and validation"],
     )
@@ -1080,7 +1141,7 @@ def synthesize_curriculum_section(
     ]
     paragraphs: list[str] = []
     index = 0
-    while count_words("\n\n".join(paragraphs)) < round(budget * 1.10) and index < len(lenses) * max(1, len(claims)):
+    while count_words("\n\n".join(paragraphs)) < round(budget * 1.03) and index < len(lenses) * max(1, len(claims)):
         claim = claims[index % len(claims)]
         ids = " ".join(f"[{item}]" for item in claim.evidence_ids)
         lead = lenses[index % len(lenses)]
@@ -1104,7 +1165,11 @@ class SectionSynthesisEngine:
     def __init__(self, reasoner: Reasoner):
         self.reasoner = reasoner
         self.last_unknown_evidence_ids: list[str] = []
-        self.used_model = False
+        self.last_analysis_model_used = False
+        self.last_synthesis_model_used = False
+        self.last_analysis_error: str | None = None
+        self.last_synthesis_error: str | None = None
+        self.last_used_fallback = False
 
     @property
     def capable(self) -> bool:
@@ -1118,14 +1183,22 @@ class SectionSynthesisEngine:
         evidence: list[EvidenceChunk],
         prior_summaries: list[str],
     ) -> SectionAnalysis:
+        self.last_analysis_model_used = False
+        self.last_analysis_error = None
+        self.last_used_fallback = False
         fallback = deterministic_section_analysis(spec, plan, section, evidence, prior_summaries)
         if not self.capable:
+            self.last_used_fallback = True
             return fallback
         try:
             result = self.reasoner._json(
                 "Return only JSON matching SectionAnalysis. Separate requirements from evidence. "
                 "Client brief text is planning context, never a factual claim. Reference profile is style only. "
-                "Every evidence claim must cite one or more supplied evidence IDs.",
+                "Every evidence claim must cite one or more supplied evidence IDs. "
+                "When evidence is empty, known_facts and evidence_claims must be empty; use observable_context, "
+                "analytical_inferences, hypotheses, data_gaps, recommended_analysis, and conditional recommendations "
+                "instead. Never state private company facts, performance, financial numbers, or internal conditions "
+                "that are not present in the evidence packet.",
                 {
                     "spec": spec.model_dump(exclude={"client_brief"}),
                     "brief_requirements": spec.client_brief,
@@ -1137,10 +1210,12 @@ class SectionSynthesisEngine:
                 },
                 SectionAnalysis,
             )
-            self.used_model = True
+            self.last_analysis_model_used = True
             sanitized = sanitize_section_analysis(result, evidence)
-            return sanitized if sanitized.evidence_claims or not evidence else fallback
-        except Exception:
+            return sanitized
+        except Exception as error:
+            self.last_analysis_error = f"{type(error).__name__}: {error}"
+            self.last_used_fallback = True
             return fallback
 
     def synthesize(
@@ -1150,39 +1225,44 @@ class SectionSynthesisEngine:
         section: DocumentSectionPlan,
         analysis: SectionAnalysis,
         evidence: list[EvidenceChunk],
+        target_range: str | None = None,
+        depth_instruction: str | None = None,
     ) -> str:
         self.last_unknown_evidence_ids = []
-        # A section with no relevant evidence must remain requirements-only;
-        # never ask the prose model to invent factual content for an empty
-        # evidence packet.
-        if not evidence and not analysis.evidence_claims:
-            return requirements_only_section(spec, section)
-        if self.capable and self.used_model:
+        self.last_synthesis_model_used = False
+        self.last_synthesis_error = None
+        self.last_used_fallback = False
+        if self.capable:
             try:
                 result = self.reasoner._json(
                     "Return only JSON with a markdown field. Write professional consulting or research prose. "
                     "Synthesize claims instead of enumerating fragments; vary paragraph structure naturally; do not mention retrieval, chunks, prompts, or workflow mechanics. "
                     "Distinguish facts from inference and hypotheses, do not invent private facts, and cite evidence only with [E1], [E2] IDs from the packet. "
-                    "Use the target range as guidance, not an exact loop or padding requirement.",
+                    "When the evidence packet is empty, write useful conditional analysis, data requirements, hypotheses, and decision criteria without claiming company facts or invented numbers. "
+                    "Use the target range as guidance, not an exact loop or padding requirement. "
+                    + (depth_instruction or ""),
                     {
                         "deliverable_type": plan.deliverable_type,
                         "audience": spec.audience,
                         "section": section.model_dump(),
                         "analysis": analysis.model_dump(),
                         "evidence_packet": evidence_packet(evidence),
-                        "target_range": self._target_range(section),
+                        "target_range": target_range or self._target_range(section),
                     },
                     SectionDraft,
                 )
                 normalized, direct_unknown = normalize_model_citations(result.markdown, evidence)
                 content, unknown = replace_evidence_ids(normalized, evidence)
                 self.last_unknown_evidence_ids = sorted(set(direct_unknown + unknown))
+                self.last_synthesis_model_used = True
                 return content
-            except Exception:
+            except Exception as error:
+                self.last_synthesis_error = f"{type(error).__name__}: {error}"
                 pass
         content, _ = synthesize_bounded_section(spec, section, analysis, evidence)
         content, unknown = replace_evidence_ids(content, evidence)
         self.last_unknown_evidence_ids = unknown
+        self.last_used_fallback = True
         return content
 
     @staticmethod
@@ -1237,6 +1317,11 @@ class EvidenceGroundedSectionWriter:
                 # Summary mode has a deliberately concise three-section shape;
                 # it should not be routed through the long-form consulting
                 # analysis path.
+                self.synthesis.last_analysis_model_used = False
+                self.synthesis.last_synthesis_model_used = False
+                self.synthesis.last_analysis_error = None
+                self.synthesis.last_synthesis_error = None
+                self.synthesis.last_used_fallback = False
                 self.last_analysis = deterministic_section_analysis(spec, plan, section, evidence, prior_summaries)
                 return self._write_uploaded(spec, section, evidence, prior_summaries, pages)
             analysis = self.synthesis.analyze(spec, plan, section, evidence, prior_summaries)
@@ -1411,36 +1496,15 @@ class EvidenceGroundedSectionWriter:
 
 
 def requirements_only_section(spec: DocumentSpec, section: DocumentSectionPlan) -> str:
-    """Write natural, bounded diagnostic prose when evidence is absent."""
+    """Emergency/local fallback only; never expand to the requested report depth."""
     title = section.title.strip().lower()
     objective = section.objective.strip().rstrip(".").lower()
     objective = objective.replace("without adding recommendations", "without adding operational advice")
     decision_word = "decision" if resolve_deliverable_type(spec) == "Summary / Brief" else "recommendation"
     paragraphs = [
-        f"The {title} workstream is part of the requested engagement and should {objective}. The supplied material does not establish the company's current position on this question, so this paragraph is a diagnostic framing rather than a factual conclusion.",
-        f"A useful review should examine the decisions, constraints, baselines, and outcomes that determine {title}. The assessment can then distinguish an observed condition from a working hypothesis and identify which threshold would justify action.",
-        f"The missing inputs are likely to include internal operating records, customer or channel measures, financial baselines, and accountable decision owners. Those inputs should be collected before a company-specific {decision_word} is treated as approved.",
+        f"The {title} workstream should {objective}. The supplied material does not establish the company's current position, so this is a diagnostic framing rather than a factual conclusion.",
+        f"A review should examine the relevant decisions, constraints, baselines, and outcomes, then distinguish an observed condition from a hypothesis. The missing inputs may include operating records, customer or channel measures, financial baselines, and accountable decision owners before a company-specific {decision_word} is approved.",
     ]
-    # An explicit long-form request still deserves a coherent diagnostic
-    # treatment offline.  Expand by analytical dimensions, never by rotating
-    # sentence frames or repeating a retrieved fragment.
-    budget = section.approximate_word_budget or 0
-    lenses = [
-        f"For {title}, the first decision criterion is whether the stated objective can be measured with a stable baseline rather than an anecdotal impression.",
-        f"The second criterion is ownership: map which role can supply the relevant record, approve a change, and review the outcome for {title}.",
-        f"A third lens is sequencing. Separate information that is needed before diagnosis from information that is only useful after a preferred option has been selected.",
-        f"The review should also record constraints that could change the decision, including capacity, cash, customer experience, channel dependencies, and timing.",
-        f"Where the evidence is incomplete, compare competing hypotheses and state what observation would confirm or weaken each one instead of presenting a gap as a weakness.",
-        f"A practical working paper for {title} should preserve the distinction between an observable public signal, an internal fact, an inference, and a recommendation.",
-        f"The output can then define a decision threshold, the minimum data needed to reach it, and the consequence of deferring the decision.",
-        f"This approach keeps the requested analysis useful without claiming that the supplied material proves a company-specific condition.",
-    ]
-    while budget and count_words("\n\n".join(paragraphs)) < round(budget * 0.88) and lenses:
-        paragraphs.append(lenses.pop(0))
-    if requires_external_research(section):
-        paragraphs.append(
-            "Public competitor, market, and internationalisation research was not available in this run. Any market conclusion should therefore remain preliminary until independent sources are reviewed and cited."
-        )
     return "\n\n".join(paragraphs)
 
 
@@ -2292,6 +2356,20 @@ def document_qc(
     leakage = reference_leakage_issues(spec, sections)
     requirements_as_evidence = brief_evidence_issues(sections, all_evidence, final_markdown)
     external_gaps = external_research_disclosure_issues(spec, sections)
+    readiness_issues: list[str] = []
+    synthesis_errors = [section.title for section in sections if section.synthesis_error]
+    if synthesis_errors:
+        readiness_issues.append("Synthesis model errors require review: " + ", ".join(synthesis_errors[:6]) + ".")
+    if spec.source_kind == "uploaded" and plan.deliverable_type == "Consulting Assessment":
+        if not all_evidence:
+            readiness_issues.append("No factual client or public evidence was successfully acquired.")
+        website_chunks = [chunk for chunk in all_evidence if (chunk.source or "").lower().startswith("website:")]
+        if spec.company_website and not spec.client_source_names and not website_chunks:
+            readiness_issues.append("Requested website evidence could not be acquired.")
+        substantive = [section for section in sections if section.section_id != "evidence"]
+        if substantive and all(section.synthesis_fallback or not section.evidence for section in substantive):
+            readiness_issues.append("Every substantive section relies on requirements-only fallback output.")
+    issues.extend(readiness_issues)
     if missing:
         issues.append("One or more planned sections are missing.")
     if failed_sections:
@@ -2339,6 +2417,10 @@ def document_qc(
         or "Reference-only" in issue
         or "requirements were incorrectly" in issue
         or "external-research result" in issue
+        or "No factual client or public evidence" in issue
+        or "Requested website evidence" in issue
+        or "Every substantive section relies" in issue
+        or "Synthesis model errors require review" in issue
         for issue in issues
     )
     return DocumentQC(
@@ -2419,11 +2501,14 @@ def external_research_disclosure_issues(
 
 def cross_section_duplication(sections: list[GeneratedSection]) -> list[str]:
     fingerprints: dict[str, list[str]] = {}
+    first_sentence_patterns: dict[str, list[str]] = {}
+    paragraph_shapes: dict[tuple[int, ...], list[str]] = {}
     for section in sections:
-        if section.section_id == "evidence" or not section.evidence:
+        if section.section_id == "evidence":
             continue
+        paragraphs = [item.strip() for item in re.split(r"\n\s*\n", section.content_markdown) if item.strip()]
         sentences = []
-        for paragraph in re.split(r"\n\s*\n", section.content_markdown):
+        for paragraph in paragraphs:
             if any(marker in paragraph.lower() for marker in (
                 "external research status",
                 "external research limitation",
@@ -2440,9 +2525,31 @@ def cross_section_duplication(sections: list[GeneratedSection]) -> list[str]:
                 cleaned = re.sub(r"\W+", " ", re.sub(r"\[[^\]]+\]", "", sentence.lower())).strip()
                 if len(cleaned.split()) >= 8:
                     sentences.append(cleaned)
+        if sentences:
+            first = re.sub(r"\[[^\]]+\]", "", sentences[0])
+            first = re.sub(r"\b(?:the|a|an)\s+[a-z][a-z -]{2,50}?\s+workstream\b", "the workstream", first)
+            first_sentence_patterns.setdefault(first, []).append(section.title)
+        shape = tuple(min(8, len(re.findall(r"\b\w+\b", paragraph)) // 35) for paragraph in paragraphs)
+        if shape:
+            paragraph_shapes.setdefault(shape, []).append(section.title)
         for sentence in sentences:
             fingerprints.setdefault(sentence, []).append(section.title)
-    return [f"{sentence[:80]} ({', '.join(titles)})" for sentence, titles in fingerprints.items() if len(set(titles)) > 1][:5]
+    issues = [
+        f"Repeated sentence pattern: {sentence[:80]} ({', '.join(titles)})"
+        for sentence, titles in first_sentence_patterns.items()
+        if len(set(titles)) > 2
+    ]
+    issues.extend(
+        f"Repeated paragraph structure across sections: {shape} ({', '.join(titles)})"
+        for shape, titles in paragraph_shapes.items()
+        if len(set(titles)) > 2
+    )
+    issues.extend(
+        f"Repeated substantive sentence: {sentence[:80]} ({', '.join(titles)})"
+        for sentence, titles in fingerprints.items()
+        if len(set(titles)) > 2
+    )
+    return issues[:8]
 
 
 def detect_contradictions(sections: list[GeneratedSection]) -> list[str]:

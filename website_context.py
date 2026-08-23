@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import html
+import ipaddress
 import re
+import socket
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlparse, urlunparse
@@ -29,11 +31,15 @@ class WebsiteFetchReport:
     indexed_pages: list[str] = field(default_factory=list)
     character_counts: dict[str, int] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
+    error_type: str | None = None
+    error_message: str | None = None
+    homepage_error: str | None = None
 
     @property
     def summary(self) -> str:
         if not self.pages_fetched:
-            return "Website unavailable — generating from supplied requirements only."
+            reason = self.error_message or (self.errors[-1] if self.errors else "no usable pages were indexed")
+            return f"Website evidence acquisition failed: {reason}"
         return (
             f"Website research: {len(self.pages_discovered)} pages discovered, "
             f"{len(self.pages_fetched)} fetched, {len(self.indexed_pages)} indexed."
@@ -81,6 +87,37 @@ def _canonical_url(value: str, base: str | None = None) -> str | None:
     if path != "/":
         path = path.rstrip("/") or "/"
     return urlunparse(("https", parsed.netloc.lower(), path, "", "", ""))
+
+
+def _host_is_private_or_local(host: str) -> bool:
+    """Reject literal or DNS-resolved private targets before opening a URL."""
+    normalized = (host or "").strip().lower().rstrip(".")
+    if normalized in {"localhost", "localhost.localdomain", "ip6-localhost"}:
+        return True
+    try:
+        addresses = {ipaddress.ip_address(normalized)}
+    except ValueError:
+        try:
+            addresses = {
+                ipaddress.ip_address(item[4][0])
+                for item in socket.getaddrinfo(normalized, 443, type=socket.SOCK_STREAM)
+            }
+        except socket.gaierror:
+            # An unresolved public hostname is left to the HTTP client, which
+            # can record the concrete acquisition error without weakening the
+            # private-address checks for resolvable targets.
+            return False
+        except OSError:
+            return False
+    return any(
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_reserved
+        or address.is_multicast
+        or address.is_unspecified
+        for address in addresses
+    )
 
 
 def _is_fetchable_link(url: str, site_host: str) -> bool:
@@ -133,12 +170,22 @@ def fetch_website_evidence(
         result = ([], report.summary, report)
         return result if return_report else result[:2]
     site_host = urlparse(normalized).hostname or ""
+    if _host_is_private_or_local(site_host):
+        reason = "Private or local network targets are not allowed."
+        report.error_type = "SSRFBlocked"
+        report.error_message = reason
+        report.errors.append(reason)
+        result = ([], report.summary, report)
+        return result if return_report else result[:2]
     # ``example.com`` is a reserved documentation host, not a client source;
     # rejecting it keeps the demo from presenting placeholder copy as evidence
     # while allowing real HTTP sites to upgrade to HTTPS and follow redirects.
     if _host_key(site_host) == "example.com":
-        report.errors.append("Reserved placeholder domain was not indexed.")
-        result = ([], "Website unavailable — generating from supplied requirements only.", report)
+        reason = "Reserved placeholder domain was not indexed."
+        report.error_type = "ReservedDomain"
+        report.error_message = reason
+        report.errors.append(reason)
+        result = ([], report.summary, report)
         return result if return_report else result[:2]
     queue = [normalized]
     seen: set[str] = set()
@@ -150,10 +197,27 @@ def fetch_website_evidence(
         seen.add(page_url)
         report.pages_discovered.append(page_url)
         try:
-            request = Request(page_url, headers={"User-Agent": "AI-Document-Studio/1.0"})
+            request = Request(
+                page_url,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"
+                    ),
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.8",
+                    "Cache-Control": "no-cache",
+                },
+            )
             with urlopen(request, timeout=8) as response:  # nosec B310 - canonical https URL
                 status = int(getattr(response, "status", 200) or 200)
+                if status >= 400:
+                    raise RuntimeError(f"HTTP {status}")
                 final_url = _canonical_url(response.geturl()) or page_url
+                final_host = urlparse(final_url).hostname or ""
+                if _host_is_private_or_local(final_host):
+                    raise RuntimeError("Redirect resolved to a private or local network target.")
                 raw = response.read(MAX_WEBSITE_BYTES).decode("utf-8", errors="ignore")
             if report.resolved_url is None:
                 report.resolved_url = final_url
@@ -178,7 +242,12 @@ def fetch_website_evidence(
                 if candidate not in queue and len(report.pages_discovered) + len(queue) < MAX_DISCOVERED_LINKS:
                     queue.append(candidate)
             if len(text) < 80:
-                report.pages_rejected.append(f"{final_url} (insufficient extracted text)")
+                reason = "insufficient extracted text"
+                report.pages_rejected.append(f"{final_url} ({reason})")
+                if len(report.pages_discovered) == 1:
+                    report.error_type = "ExtractionError"
+                    report.error_message = reason
+                    report.homepage_error = reason
                 continue
             page_number = len(chunks) + 1
             chunks.append(
@@ -193,10 +262,21 @@ def fetch_website_evidence(
             report.indexed_pages.append(final_url)
         except Exception as error:  # website context is optional
             report.pages_rejected.append(page_url)
-            report.errors.append(f"{page_url}: {error}")
+            error_status = getattr(error, "code", None)
+            if error_status is not None and report.status_code is None:
+                report.status_code = int(error_status)
+            report.error_type = type(error).__name__
+            report.error_message = str(error) or type(error).__name__
+            detail = f"{report.error_type}: {report.error_message}"
+            report.errors.append(f"{page_url}: {detail}")
+            if len(report.pages_discovered) == 1:
+                report.homepage_error = detail
     if not report.resolved_url:
         report.resolved_url = normalized
     if not chunks:
+        if not report.error_message:
+            report.error_type = "NoUsablePages"
+            report.error_message = "No usable website pages were indexed."
         report.errors.append("No usable website pages were indexed.")
     notice = None if chunks else report.summary
     result = (chunks, notice, report)

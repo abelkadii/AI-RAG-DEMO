@@ -81,6 +81,8 @@ class SectionAnalysis(BaseModel):
     hypotheses: list[str] = Field(default_factory=list)
     recommendations: list[str] = Field(default_factory=list)
     data_gaps: list[str] = Field(default_factory=list)
+    observable_context: list[str] = Field(default_factory=list)
+    recommended_analysis: list[str] = Field(default_factory=list)
     evidence_ids: list[str] = Field(default_factory=list)
     planned_paragraphs: list[str] = Field(default_factory=list)
 
@@ -120,6 +122,10 @@ class GeneratedSection(BaseModel):
     research_trace: AgentTrace
     qc: SectionQC
     analysis: SectionAnalysis | None = None
+    analysis_model_used: bool = False
+    synthesis_model_used: bool = False
+    synthesis_error: str | None = None
+    synthesis_fallback: bool = False
     revised: bool = False
     revision_count: int = 0
 
@@ -162,3 +168,6 @@ class DocumentTrace(BaseModel):
     total_unique_cited_pages: int = 0
     final_word_count: int = 0
     target_word_count: int | None = None
+    synthesis_engine: str = ""
+    synthesis_model: str | None = None
+    website_report: dict[str, object] | None = None

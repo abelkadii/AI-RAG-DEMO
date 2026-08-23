@@ -98,10 +98,14 @@ def research_public_sources(
     *,
     max_queries: int = MAX_EXTERNAL_QUERIES,
     max_results: int = MAX_EXTERNAL_RESULTS,
+    enabled: bool | None = None,
 ) -> tuple[list[EvidenceChunk], ExternalResearchReport]:
     """Collect bounded search-result evidence without persistent storage."""
     selected_queries = [" ".join(query.split()) for query in queries if query.strip()][:max(1, min(max_queries, MAX_EXTERNAL_QUERIES))]
-    report = ExternalResearchReport(queries=selected_queries, enabled=external_research_enabled())
+    report = ExternalResearchReport(
+        queries=selected_queries,
+        enabled=external_research_enabled() if enabled is None else enabled,
+    )
     if not report.enabled:
         return [], report
     chunks: list[EvidenceChunk] = []
@@ -109,7 +113,14 @@ def research_public_sources(
     for query_index, query in enumerate(selected_queries, start=1):
         endpoint = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
         try:
-            request = Request(endpoint, headers={"User-Agent": "AI-Document-Studio/1.0"})
+            request = Request(
+                endpoint,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.8",
+                },
+            )
             with urlopen(request, timeout=6) as response:  # nosec B310 - fixed HTTPS search endpoint
                 raw = response.read(600_000).decode("utf-8", errors="ignore")
             parser = _SearchParser()
@@ -127,7 +138,7 @@ def research_public_sources(
                     EvidenceChunk(
                         chunk_id=f"external-{query_index:02d}-{result_index:02d}",
                         page=1,
-                        section="Public search result",
+                        section=f"{title[:120]} | {target}",
                         source=f"Web Research: {host}",
                         text=text[:MAX_EXTERNAL_CHARS],
                     )
