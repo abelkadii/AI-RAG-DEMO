@@ -225,6 +225,90 @@ class SectionDraft(BaseModel):
     markdown: str = ""
 
 
+class StrategyReportAnalysis(BaseModel):
+    """Global consulting analysis used by the dedicated uploaded-client path."""
+
+    client_profile: list[str] = Field(default_factory=list)
+    publicly_observable_facts: list[SectionEvidenceClaim] = Field(default_factory=list)
+    customer_proposition: list[str] = Field(default_factory=list)
+    market_signals: list[str] = Field(default_factory=list)
+    operating_model_hypotheses: list[str] = Field(default_factory=list)
+    customer_segments: list[str] = Field(default_factory=list)
+    business_model_questions: list[str] = Field(default_factory=list)
+    financial_analysis_priorities: list[str] = Field(default_factory=list)
+    workforce_capability_questions: list[str] = Field(default_factory=list)
+    brand_and_marketing_findings: list[str] = Field(default_factory=list)
+    internationalisation_questions: list[str] = Field(default_factory=list)
+    ai_use_cases: list[str] = Field(default_factory=list)
+    strategic_opportunities: list[str] = Field(default_factory=list)
+    strategic_risks: list[str] = Field(default_factory=list)
+    recommendations: list[str] = Field(default_factory=list)
+    roadmap_priorities: list[str] = Field(default_factory=list)
+    kpi_candidates: list[str] = Field(default_factory=list)
+    data_gaps: list[str] = Field(default_factory=list)
+    validation_requirements: list[str] = Field(default_factory=list)
+    evidence_map: list[SectionEvidenceClaim] = Field(default_factory=list)
+    section_guidance: dict[str, list[str]] = Field(default_factory=dict)
+
+    @field_validator("publicly_observable_facts", "evidence_map", mode="before")
+    @classmethod
+    def normalize_claim_fields(cls, value):
+        return _normalize_claim_items(value)
+
+    @field_validator(
+        "client_profile",
+        "customer_proposition",
+        "market_signals",
+        "operating_model_hypotheses",
+        "customer_segments",
+        "business_model_questions",
+        "financial_analysis_priorities",
+        "workforce_capability_questions",
+        "brand_and_marketing_findings",
+        "internationalisation_questions",
+        "ai_use_cases",
+        "strategic_opportunities",
+        "strategic_risks",
+        "recommendations",
+        "roadmap_priorities",
+        "kpi_candidates",
+        "data_gaps",
+        "validation_requirements",
+        mode="before",
+    )
+    @classmethod
+    def normalize_text_lists(cls, value):
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, dict):
+            value = [value]
+        normalized: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                normalized.append(item)
+            elif isinstance(item, dict):
+                text = next((item.get(key) for key in ("text", "finding", "recommendation", "hypothesis", "question", "risk", "opportunity") if item.get(key)), None)
+                if text:
+                    normalized.append(str(text))
+        return normalized
+
+
+class ReportSectionDraft(BaseModel):
+    section_id: str
+    title: str = ""
+    markdown: str = ""
+
+
+class ReportBatchDraft(BaseModel):
+    sections: list[ReportSectionDraft] = Field(default_factory=list)
+
+
+class FinalizedReport(BaseModel):
+    markdown: str = ""
+
+
 class DocumentPlan(BaseModel):
     title: str
     sections: list[DocumentSectionPlan]
@@ -312,3 +396,10 @@ class DocumentTrace(BaseModel):
     smoke_test_sections: list[str] = Field(default_factory=list)
     external_research_enabled: bool | None = None
     website_report: dict[str, object] | None = None
+    total_llm_calls: int = 0
+    analysis_llm_calls: int = 0
+    synthesis_llm_calls: int = 0
+    finalization_llm_calls: int = 0
+    external_search_calls: int = 0
+    external_results_count: int = 0
+    generation_seconds: float | None = None

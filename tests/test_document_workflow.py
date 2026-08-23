@@ -2,7 +2,17 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from document_export import docx_bytes, markdown_bytes, pdf_bytes
-from document_models import DocumentSectionPlan, DocumentSpec, GeneratedSection, SectionAnalysis, SectionDraft, SectionQC
+from document_models import (
+    DocumentSectionPlan,
+    DocumentSpec,
+    GeneratedSection,
+    ReportBatchDraft,
+    ReportSectionDraft,
+    SectionAnalysis,
+    SectionDraft,
+    SectionQC,
+    StrategyReportAnalysis,
+)
 from document_workflow import (
     DEFAULT_BRIEF,
     DocumentWorkflow,
@@ -25,6 +35,10 @@ from document_workflow import (
     SectionSynthesisEngine,
     cross_section_duplication,
     requirements_only_section,
+    assemble_consulting_markdown,
+    consulting_final_output_issues,
+    duplicate_heading_count,
+    sanitize_generated_section_body,
 )
 from llm import LocalReasoner
 from models import AgentTrace, EvidenceChunk
@@ -548,6 +562,38 @@ class CapableSectionReasoner(LocalReasoner):
         return SectionDraft(markdown="Assess the decision criteria and state what internal data is required before reaching a company-specific conclusion.")
 
 
+class BatchConsultingReasoner(LocalReasoner):
+    model = "test-consulting-model"
+
+    def __init__(self):
+        self.calls = []
+
+    def _json(self, _system, payload, schema, **_kwargs):
+        self.calls.append(schema.__name__)
+        if schema is StrategyReportAnalysis:
+            return StrategyReportAnalysis(
+                client_profile=["Speckled Space is assessed from public evidence."],
+                recommendations=["Validate the operating baseline and sequence growth work."],
+                data_gaps=["Internal financial, workforce, and customer data are required."],
+                evidence_map=[{"text": "The website describes the public proposition.", "evidence_ids": ["E1"]}],
+                publicly_observable_facts=[{"text": "The website describes the public proposition.", "evidence_ids": ["E1"]}],
+            )
+        if schema is ReportBatchDraft:
+            sections = [
+                ReportSectionDraft(
+                    section_id=item["section_id"],
+                    title=item["title"],
+                    markdown=(
+                        f"Speckled Space should assess {item['title'].lower()} using public evidence and internal validation. [E1]\n\n"
+                        "Internal data is required before treating operating, financial, workforce, or market hypotheses as facts. [E1]"
+                    ),
+                )
+                for item in payload["batch_sections"]
+            ]
+            return ReportBatchDraft(sections=sections)
+        return SectionDraft(markdown="")
+
+
 def test_empty_section_evidence_still_uses_capable_synthesis_model():
     reasoner = CapableSectionReasoner()
     spec = DocumentSpec(
@@ -605,6 +651,52 @@ def test_consulting_smoke_mode_accepts_numbered_scope_selectors(monkeypatch):
         ).run(spec)
         assert [section.section_id for section in trace.sections if section.section_id != "evidence"] == [expected]
         assert trace.external_research_enabled is False
+
+
+def test_uploaded_consulting_uses_dedicated_batched_path_without_legacy_revision():
+    brief = """Create a business strategy report for Speckled Space.
+
+Stage 1 - Business Diagnostic & Competitive Landscape
+1.1 Organisational Health Check & Operating Model Review
+1.2 Competitive Landscape & Market Positioning Assessment
+
+Stage 2 - Strategic Planning & Business Development
+2.1 Market & Customer Intelligence
+2.2 Business Model & Financial Strategy
+2.3 Workforce Planning
+2.4 Brand & Marketing Strategy
+2.5 Internationalisation
+2.6 AI Integration Review & Adoption Roadmap
+2.7 Strategic Roadmap & Comprehensive Action Plan
+
+Stage 3 - Implementation Planning and Knowledge Transfer
+3.1 Strategic Frameworks & Execution Training Workshop
+3.2 AI-Enabled Process & Digital Tools Workshop
+3.3 Playbooks, Change Readiness & Project Closure"""
+    reasoner = BatchConsultingReasoner()
+    spec = DocumentSpec(
+        title="Evidence-Grounded Report",
+        client_brief=brief,
+        source_kind="uploaded",
+        deliverable_type="Auto",
+        target_depth="Standard",
+        company_website="https://speckledspace.com/",
+    )
+    trace = DocumentWorkflow(
+        retriever=DocumentFakeRetriever(),
+        reasoner=reasoner,
+        external_research=False,
+    ).run(spec)
+
+    assert trace.plan.deliverable_type == "Consulting Assessment"
+    assert trace.analysis_llm_calls == 1
+    assert trace.synthesis_llm_calls <= 4
+    assert trace.total_llm_calls <= 6
+    assert trace.total_research_iterations == 0
+    assert "connect the requested focus" not in trace.final_markdown
+    assert "Knowledge Base" not in trace.final_markdown
+    assert "Client Brief" not in trace.final_markdown
+    assert "E1" not in trace.final_markdown
 
 
 def test_local_fallback_cannot_mark_long_consulting_report_ready():
@@ -804,6 +896,64 @@ def test_evidence_ids_are_replaced_deterministically_and_unknown_ids_rejected():
     assert "[Strategy_Report.pdf p.12]" in cleaned
     assert "[E9]" not in cleaned
     assert unknown == ["E9"]
+
+
+def test_grouped_evidence_ids_are_replaced_without_raw_tokens():
+    evidence = [
+        EvidenceChunk(chunk_id="E1", page=1, source="Website: speckledspace.com", text="The website describes home decor products."),
+        EvidenceChunk(chunk_id="E2", page=2, source="Website: speckledspace.com", text="The website describes delivery and service."),
+        EvidenceChunk(chunk_id="E3", page=3, source="Website: speckledspace.com", text="The website describes showroom contact details."),
+    ]
+    cleaned, unknown = replace_evidence_ids("The proposition is visible [E1, E2]. Contact details are visible [E3].", evidence)
+    assert unknown == []
+    assert "E1" not in cleaned and "E2" not in cleaned and "E3" not in cleaned
+    assert "[Website: speckledspace.com p.1][Website: speckledspace.com p.2]" in cleaned
+
+
+def test_duplicate_section_heading_is_removed_from_model_body():
+    body = "## Stage 1 - Business Diagnostic\n\n### Stage 1 - Business Diagnostic\n\nUseful analysis [E1]."
+    cleaned = sanitize_generated_section_body(body, "Stage 1 - Business Diagnostic")
+    assert not cleaned.startswith("#")
+    assert duplicate_heading_count("## Stage 1 - Business Diagnostic\n### Stage 1 - Business Diagnostic\n") == 1
+
+
+def test_consulting_final_qc_rejects_legacy_revision_language_and_raw_e_ids():
+    spec = DocumentSpec(
+        client_brief="Create a business strategy report.\nStage 1 - Diagnostic\n1.1 Health\n1.2 Market\nStage 2 - Planning\n2.1 Market\n2.2 Finance\n2.3 Workforce\n2.4 Brand\n2.5 International\n2.6 AI\n2.7 Roadmap\nStage 3 - Implementation\n3.1 Workshop\n3.2 AI Tools\n3.3 Playbooks",
+        source_kind="uploaded",
+        deliverable_type="Consulting Assessment",
+    )
+    plan = make_workflow().plan(spec, [])
+    issues = consulting_final_output_issues("connect the requested focus [E1]\n\nCore Biz Holdings", spec, plan)
+    assert any("Raw E" in issue for issue in issues)
+    assert any("connect the requested focus" in issue for issue in issues)
+    assert any("Core Biz" in issue for issue in issues)
+
+
+def test_consulting_front_matter_excludes_debug_metadata():
+    spec = DocumentSpec(
+        title="Speckled Space Business Strategy Report",
+        client_brief="Create a business strategy report.",
+        source_kind="uploaded",
+        deliverable_type="Consulting Assessment",
+        reference_source_names=["Core Biz Holdings - Business Strategy EDG Report V2.pdf"],
+        company_website="https://speckledspace.com/",
+    )
+    plan = make_workflow().plan(spec, [])
+    section = GeneratedSection(
+        section_id="executive-summary",
+        title="Executive Summary",
+        objective="Summarize.",
+        content_markdown="Speckled Space has a public website. [Website: speckledspace.com p.1]",
+        evidence=[],
+        research_trace=AgentTrace(question="q"),
+        qc=SectionQC(passed=True, citation_valid=True),
+    )
+    markdown = assemble_consulting_markdown(spec, plan, [section])
+    assert markdown.startswith("# Speckled Space Business Strategy Report")
+    assert "Knowledge Base" not in markdown
+    assert "Reference Precedent" not in markdown
+    assert "Client Brief" not in markdown
 
 
 def test_citation_sentence_split_does_not_break_pdf_filename():

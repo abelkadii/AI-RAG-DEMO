@@ -624,9 +624,17 @@ def render_document_results(trace: DocumentTrace) -> None:
             ("Target word count", f"{trace.target_word_count:,}" if trace.target_word_count else "—"),
             ("Sections passing QC", str(sections_passing)),
             ("Final review", status),
+            ("LLM calls", str(trace.total_llm_calls)),
+            ("Runtime", f"{trace.generation_seconds or 0:.1f}s"),
         ]
     )
     st.caption(f"Sections revised once by QC: {revised}")
+    if trace.plan.deliverable_type == "Consulting Assessment" and trace.spec.source_kind == "uploaded":
+        st.caption(
+            f"Model calls: analysis {trace.analysis_llm_calls}, synthesis {trace.synthesis_llm_calls}, "
+            f"finalization {trace.finalization_llm_calls} | External research: "
+            f"{trace.external_search_calls} calls / {trace.external_results_count} results"
+        )
     st.caption(
         f"Reference precedent: {', '.join(trace.spec.reference_source_names) if trace.spec.reference_source_names else 'None'} | "
         f"Client sources: {', '.join(trace.spec.client_source_names) if trace.spec.client_source_names else ('No client PDFs; website/public evidence only' if trace.spec.source_kind == 'uploaded' else 'AWS sample corpus')} | "

@@ -16,12 +16,15 @@ from document_models import (
     DocumentSectionPlan,
     DocumentSpec,
     DocumentTrace,
+    FinalizedReport,
     GeneratedSection,
     ReferenceReportProfile,
+    ReportBatchDraft,
     SectionAnalysis,
     SectionDraft,
     SectionEvidenceClaim,
     SectionQC,
+    StrategyReportAnalysis,
 )
 from llm import Reasoner, configured_reasoner
 from models import AgentTrace, CitationValidation, EvidenceChunk
@@ -606,6 +609,8 @@ class DocumentWorkflow:
         self._event(on_event, "Planning document")
         plan = self.plan(spec, survey)
         execution_plan, smoke_test_mode = self.execution_plan(plan, spec, on_event)
+        if survey and self.use_dedicated_consulting_path(spec, plan, smoke_test_mode):
+            return self.run_consulting_report(spec, plan, survey, started, on_event)
         if spec.source_kind == "uploaded":
             self._event(on_event, f"Requested type: {spec.deliverable_type}")
             self._event(on_event, f"Effective type: {plan.deliverable_type}")
@@ -820,6 +825,299 @@ class DocumentWorkflow:
             external_research_enabled=self.external_research_enabled(spec) if spec.source_kind == "uploaded" else None,
         )
 
+    def use_dedicated_consulting_path(self, spec: DocumentSpec, plan: DocumentPlan, smoke_test_mode: bool) -> bool:
+        return (
+            spec.source_kind == "uploaded"
+            and plan.deliverable_type == "Consulting Assessment"
+            and not smoke_test_mode
+        )
+
+    def run_consulting_report(
+        self,
+        spec: DocumentSpec,
+        plan: DocumentPlan,
+        survey: list[EvidenceChunk],
+        started: datetime,
+        on_event: Callable[[str], None] | None = None,
+    ) -> DocumentTrace:
+        """Dedicated uploaded-client strategy path: draft, finalize, validate."""
+        generation_started = time.perf_counter()
+        metrics = {
+            "total_llm_calls": 0,
+            "analysis_llm_calls": 0,
+            "synthesis_llm_calls": 0,
+            "finalization_llm_calls": 0,
+            "external_search_calls": 0,
+            "external_results_count": 0,
+        }
+        self._event(on_event, f"Requested type: {spec.deliverable_type}")
+        self._event(on_event, f"Effective type: {plan.deliverable_type}")
+        self._event(on_event, "Collecting company evidence")
+        external_chunks: list[EvidenceChunk] = []
+        external_report = None
+        if self.external_research_enabled(spec):
+            self._event(on_event, "Researching market context")
+            queries = consulting_external_queries(spec)
+            external_chunks, external_report = research_public_sources(queries, enabled=True)
+            metrics["external_search_calls"] = len(getattr(external_report, "queries", queries))
+            metrics["external_results_count"] = len(external_chunks)
+            self._event(on_event, external_report.notice)
+        else:
+            self._event(on_event, "Market context: external research disabled")
+        evidence = build_global_evidence_pack(
+            self.retriever,
+            plan,
+            survey + external_chunks,
+            evidence_k=max(self.evidence_k, 8),
+        )
+        evidence = assign_consulting_evidence_ids(evidence)
+        self._event(on_event, f"Company evidence items: {len(evidence)}")
+        self._event(on_event, "Building strategy analysis")
+        analysis_started = time.perf_counter()
+        analysis, analysis_model_used, analysis_error = self.consulting_analysis(spec, plan, evidence)
+        metrics["analysis_llm_calls"] = 1 if analysis_model_used else 0
+        metrics["total_llm_calls"] += metrics["analysis_llm_calls"]
+        sections: list[GeneratedSection] = []
+        for label, batch_sections in consulting_batches(plan):
+            self._event(on_event, f"Drafting {label}")
+            batch_started = time.perf_counter()
+            drafts, synthesis_model_used, synthesis_error = self.consulting_batch_draft(
+                spec,
+                plan,
+                analysis,
+                evidence,
+                batch_sections,
+            )
+            if synthesis_model_used:
+                metrics["synthesis_llm_calls"] += 1
+                metrics["total_llm_calls"] += 1
+            for section_plan in batch_sections:
+                raw = drafts.get(section_plan.section_id, "")
+                content = sanitize_generated_section_body(raw, section_plan.title)
+                content, unknown = replace_evidence_ids(content, evidence)
+                content = redact_builtin_branding(content)
+                qc = deterministic_content_checks(spec, plan, section_plan, content, evidence)
+                citation_validation = consulting_validate_citations(content, evidence)
+                if unknown or re.search(r"\bE\d+\b", content):
+                    qc.passed = False
+                    qc.citation_valid = False
+                    qc.issues.append("Raw or unknown evidence IDs remain in the section.")
+                else:
+                    qc.citation_valid = citation_validation.valid
+                    qc.passed = qc.passed and citation_validation.valid
+                if synthesis_error:
+                    qc.passed = False
+                    qc.issues.append("Synthesis model error requires review.")
+                sections.append(
+                    GeneratedSection(
+                        section_id=section_plan.section_id,
+                        title=section_plan.title,
+                        objective=section_plan.objective,
+                        content_markdown=content,
+                        evidence=serializable_evidence(evidence),
+                        research_trace=AgentTrace(
+                            question=section_plan.research_question or section_plan.objective,
+                            total_iterations=0,
+                            stop_reason="global_evidence_pack",
+                        ),
+                        qc=qc,
+                        analysis=SectionAnalysis(
+                            section_id=section_plan.section_id,
+                            section_mode=section_mode(section_plan, plan.deliverable_type),
+                            objective=section_plan.objective,
+                            requirements=section_plan.requirements,
+                            evidence_claims=analysis.evidence_map[:8],
+                            known_facts=analysis.publicly_observable_facts[:8],
+                            data_gaps=analysis.data_gaps[:6],
+                            recommendations=analysis.recommendations[:6],
+                        ),
+                        analysis_model_used=analysis_model_used,
+                        analysis_error=analysis_error,
+                        synthesis_model_used=synthesis_model_used,
+                        synthesis_error=synthesis_error,
+                        synthesis_fallback=not synthesis_model_used,
+                        latency_ms=int((time.perf_counter() - batch_started) * 1000),
+                    )
+                )
+        evidence_plan = next((section for section in plan.sections if section.section_id == "evidence"), None)
+        if evidence_plan:
+            sections.append(
+                GeneratedSection(
+                    section_id="evidence",
+                    title=evidence_plan.title,
+                    objective=evidence_plan.objective,
+                    content_markdown="References are generated from citations used in the previous sections.",
+                    evidence=[],
+                    research_trace=AgentTrace(question="", stop_reason="generated_from_used_citations"),
+                    qc=SectionQC(passed=True, requirements_covered=["references-generated"], citation_valid=True),
+                    latency_ms=0,
+                )
+            )
+        draft_markdown = assemble_consulting_markdown(spec, plan, sections)
+        draft_issues = consulting_final_output_issues(draft_markdown, spec, plan)
+        final_markdown = draft_markdown
+        finalization_used = False
+        if should_finalize_consulting_report(draft_markdown, draft_issues, spec):
+            self._event(on_event, "Finalizing report")
+            finalized, used, error = self.finalize_consulting_report(spec, plan, analysis, evidence, draft_markdown, draft_issues)
+            if used:
+                metrics["finalization_llm_calls"] += 1
+                metrics["total_llm_calls"] += 1
+                final_markdown = finalized
+                finalization_used = True
+            if error:
+                draft_issues.append(f"Finalization model error: {error}")
+            final_markdown, _ = replace_evidence_ids(final_markdown, evidence)
+            final_markdown = sanitize_full_consulting_markdown(final_markdown, spec, plan)
+        self._event(on_event, "Validating evidence and citations")
+        citation_validation = consulting_validate_citations(final_markdown, evidence)
+        final_issues = consulting_final_output_issues(final_markdown, spec, plan)
+        if not finalization_used:
+            final_issues += draft_issues
+        if final_issues:
+            citation_validation.valid = False
+            citation_validation.uncited_claims.extend(final_issues[:12])
+        final_qc = document_qc(spec, plan, sections, citation_validation, final_markdown, evidence)
+        if final_issues:
+            final_qc.major_issues.extend(issue for issue in final_issues if issue not in final_qc.major_issues)
+            final_qc.passed = False
+            final_qc.summary = "Document review found issues to inspect."
+        completed = datetime.now(timezone.utc)
+        self._event(on_event, "Rendering PDF")
+        return DocumentTrace(
+            spec=spec,
+            plan=plan,
+            sections=sections,
+            final_qc=final_qc,
+            final_markdown=final_markdown,
+            citation_validation=citation_validation,
+            started_at=started.isoformat(),
+            completed_at=completed.isoformat(),
+            duration_ms=int((completed - started).total_seconds() * 1000),
+            total_research_iterations=0,
+            total_unique_evidence_pages=len({(chunk.source, chunk.page) for chunk in evidence}),
+            total_retrieved_evidence_chunks=len(evidence),
+            total_unique_cited_pages=len({(source, page) for source, page in citation_pairs(final_markdown)}),
+            final_word_count=count_report_words(final_markdown),
+            target_word_count=target_word_count(spec),
+            synthesis_engine=(
+                f"OpenAI ({getattr(self.reasoner, 'model', 'configured model')})"
+                if callable(getattr(self.reasoner, "_json", None))
+                else "local fallback"
+            ),
+            synthesis_model=getattr(self.reasoner, "model", None),
+            smoke_test_mode=False,
+            smoke_test_sections=[],
+            external_research_enabled=self.external_research_enabled(spec),
+            total_llm_calls=metrics["total_llm_calls"],
+            analysis_llm_calls=metrics["analysis_llm_calls"],
+            synthesis_llm_calls=metrics["synthesis_llm_calls"],
+            finalization_llm_calls=metrics["finalization_llm_calls"],
+            external_search_calls=metrics["external_search_calls"],
+            external_results_count=metrics["external_results_count"],
+            generation_seconds=round(time.perf_counter() - generation_started, 2),
+        )
+
+    def consulting_analysis(
+        self,
+        spec: DocumentSpec,
+        plan: DocumentPlan,
+        evidence: list[EvidenceChunk],
+    ) -> tuple[StrategyReportAnalysis, bool, str | None]:
+        fallback = deterministic_strategy_analysis(spec, evidence)
+        if not callable(getattr(self.reasoner, "_json", None)):
+            return fallback, False, None
+        try:
+            result = self.reasoner._json(
+                "Return only JSON matching StrategyReportAnalysis. Build one global consulting analysis from the supplied client evidence. "
+                "Classify statements conceptually as facts, inferences, hypotheses, recommendations, or data required through field placement. "
+                "Reference precedent is style only, never factual evidence. Client brief is requirements only, never cited evidence. "
+                "Do not invent revenue, margin, headcount, market share, internal technology stack, workforce capability, financial condition, or operational performance. "
+                "Every publicly observable fact and evidence_map item must cite one or more evidence_ids from the packet.",
+                {
+                    "report_title": plan.title,
+                    "client_brief": spec.client_brief,
+                    "audience": spec.audience,
+                    "reference_profile": plan.reference_profile.model_dump() if plan.reference_profile else None,
+                    "evidence": evidence_packet(evidence, limit=900),
+                    "required_sections": [section.model_dump() for section in plan.sections if section.section_id != "evidence"],
+                },
+                StrategyReportAnalysis,
+                max_attempts=2,
+                token_limit=9000,
+            )
+            return sanitize_strategy_analysis(result, evidence), True, None
+        except Exception as error:
+            return fallback, False, f"{type(error).__name__}: {error}"
+
+    def consulting_batch_draft(
+        self,
+        spec: DocumentSpec,
+        plan: DocumentPlan,
+        analysis: StrategyReportAnalysis,
+        evidence: list[EvidenceChunk],
+        sections: list[DocumentSectionPlan],
+    ) -> tuple[dict[str, str], bool, str | None]:
+        fallback = {section.section_id: deterministic_consulting_section(spec, section, analysis, evidence) for section in sections}
+        if not callable(getattr(self.reasoner, "_json", None)):
+            return fallback, False, None
+        try:
+            result = self.reasoner._json(
+                "Return only JSON: {sections:[{section_id,title,markdown}]}. Write BODY ONLY for each section; do not repeat the section heading. "
+                "Write as one professional consulting team. Use concise, specific strategy prose. Cite each factual or evidence-based sentence with the exact supporting [E#] IDs. "
+                "Use 1-2 evidence IDs for a claim when possible, not the whole packet. Do not leave raw evidence lists like [E1, E2, E3] unless each ID supports that sentence. "
+                "Avoid internal workflow language, retrieval terminology, legacy repair instructions, and repeated evidence-boundary boilerplate. "
+                "Where private data is missing, state the limitation naturally and briefly. Do not invent unsupported market numbers or internal facts.",
+                {
+                    "report_title": plan.title,
+                    "target_total_words": plan.target_word_count or 3250,
+                    "batch_sections": [section.model_dump() for section in sections],
+                    "client_brief": spec.client_brief,
+                    "analysis": analysis.model_dump(),
+                    "evidence": evidence_packet(evidence),
+                },
+                ReportBatchDraft,
+                max_attempts=2,
+                token_limit=4200,
+            )
+            drafts = {item.section_id: item.markdown for item in result.sections if item.section_id}
+            if not drafts:
+                return fallback, False, "ReportBatchDraft contained no sections."
+            return {section.section_id: drafts.get(section.section_id, fallback[section.section_id]) for section in sections}, True, None
+        except Exception as error:
+            return fallback, False, f"{type(error).__name__}: {error}"
+
+    def finalize_consulting_report(
+        self,
+        spec: DocumentSpec,
+        plan: DocumentPlan,
+        analysis: StrategyReportAnalysis,
+        evidence: list[EvidenceChunk],
+        draft_markdown: str,
+        qc_issues: list[str],
+    ) -> tuple[str, bool, str | None]:
+        if not callable(getattr(self.reasoner, "_json", None)):
+            return draft_markdown, False, None
+        try:
+            result = self.reasoner._json(
+                "Return only JSON with a markdown field. Edit the supplied report; do not regenerate from scratch. "
+                "Preserve required Stage 1-3 coverage and supported analysis. Fix repetition, duplicate headings, malformed citations, awkward transitions, excessive disclaimer language, and verbosity. "
+                "Compress to approximately 2700-4000 words excluding references. Do not add unsupported factual claims, market numbers, Core Biz facts, client-brief citations, raw E tokens, or internal pipeline language.",
+                {
+                    "draft_markdown": draft_markdown,
+                    "qc_issues": qc_issues,
+                    "analysis": analysis.model_dump(),
+                    "evidence": evidence_packet(evidence),
+                    "target_words": plan.target_word_count or 3250,
+                },
+                FinalizedReport,
+                max_attempts=2,
+                token_limit=6500,
+            )
+            return result.markdown or draft_markdown, True, None
+        except Exception as error:
+            return draft_markdown, False, f"{type(error).__name__}: {error}"
+
     @staticmethod
     def _event(callback: Callable[[str], None] | None, message: str) -> None:
         if callback:
@@ -904,6 +1202,336 @@ class DocumentWorkflow:
             ),
         )
         return filtered, merge_agent_traces(section.title, traces)
+
+
+def consulting_external_queries(spec: DocumentSpec) -> list[str]:
+    client = inferred_client_name(spec)
+    return [
+        f"{client} Singapore home decor home furnishings ecommerce trends",
+        "Singapore home decor home furnishings ecommerce competitive landscape category leaders",
+        "Singapore home furnishings decor consumer trends regional ecommerce",
+        f"{client} cross border expansion home decor Singapore regional market considerations",
+    ]
+
+
+def build_global_evidence_pack(
+    retriever,
+    plan: DocumentPlan,
+    seed_evidence: list[EvidenceChunk],
+    evidence_k: int = 8,
+) -> list[EvidenceChunk]:
+    collected: dict[str, EvidenceChunk] = {}
+    for chunk in seed_evidence:
+        if (chunk.source or "").strip().lower() in {"client brief", "requirements"}:
+            continue
+        current = collected.get(chunk.chunk_id)
+        if current is None or chunk.score > current.score:
+            collected[chunk.chunk_id] = chunk
+    queries = [
+        "company overview product assortment customer proposition delivery showroom reviews",
+        "pricing product categories brand marketing offers customer service",
+        "contact showroom operations delivery returns residential space decor",
+    ]
+    for section in plan.sections:
+        if section.section_id != "evidence":
+            queries.append(" ".join([section.title, section.objective, *section.questions]))
+    for query in queries[:18]:
+        for chunk in retriever.search(query, max(16, evidence_k * 2)):
+            if (chunk.source or "").strip().lower() in {"client brief", "requirements"}:
+                continue
+            current = collected.get(chunk.chunk_id)
+            if current is None or chunk.score > current.score:
+                collected[chunk.chunk_id] = chunk
+    return diversify_global_evidence(list(collected.values()), limit=24)
+
+
+def diversify_global_evidence(candidates: list[EvidenceChunk], limit: int = 24) -> list[EvidenceChunk]:
+    useful = [chunk for chunk in candidates if useful_evidence_sentence(normalize_claim_text(chunk.text[:320])) or len(chunk.text.strip()) >= 60]
+    useful.sort(key=lambda item: item.score, reverse=True)
+    selected: list[EvidenceChunk] = []
+    page_counts: dict[tuple[str, int], int] = {}
+    while useful and len(selected) < limit:
+        best_index = None
+        best_value = float("-inf")
+        for index, chunk in enumerate(useful):
+            page_key = (chunk.source, chunk.page)
+            if page_counts.get(page_key, 0) >= 2:
+                continue
+            similarity = max((term_jaccard(chunk.text, item.text) for item in selected), default=0.0)
+            value = float(chunk.score) - (0.22 * similarity) + (0.08 if page_counts.get(page_key, 0) == 0 else 0)
+            if value > best_value:
+                best_value = value
+                best_index = index
+        if best_index is None:
+            break
+        chunk = useful.pop(best_index)
+        selected.append(chunk)
+        key = (chunk.source, chunk.page)
+        page_counts[key] = page_counts.get(key, 0) + 1
+    return selected
+
+
+def assign_consulting_evidence_ids(evidence: list[EvidenceChunk]) -> list[EvidenceChunk]:
+    assigned: list[EvidenceChunk] = []
+    for index, chunk in enumerate(evidence, start=1):
+        assigned.append(chunk.model_copy(update={"chunk_id": f"E{index}"}))
+    return assigned
+
+
+def deterministic_strategy_analysis(spec: DocumentSpec, evidence: list[EvidenceChunk]) -> StrategyReportAnalysis:
+    claims = []
+    for index, claim in enumerate(synthesize_evidence_claims(evidence, limit=10), start=1):
+        evidence_index = next((idx for idx, chunk in enumerate(evidence, start=1) if chunk.chunk_id == claim.chunk.chunk_id), index)
+        claims.append(SectionEvidenceClaim(text=claim.text, evidence_ids=[f"E{evidence_index}"]))
+    return StrategyReportAnalysis(
+        client_profile=[
+            f"{inferred_client_name(spec)} is assessed from public client evidence and the supplied strategy scope.",
+        ],
+        publicly_observable_facts=claims[:6],
+        customer_proposition=["Use website evidence to describe the observed proposition, product range, service promises, and trust signals."],
+        market_signals=["External market findings require independent validation unless public research evidence is available."],
+        operating_model_hypotheses=["Internal operating model performance cannot be treated as established without interviews, process data, and management information."],
+        customer_segments=["Potential customer segments should be validated against sales, traffic, and margin data."],
+        business_model_questions=["Clarify revenue mix, gross margin, stock turn, fulfilment cost, and channel economics."],
+        financial_analysis_priorities=["Build baseline revenue, margin, unit economics, inventory, and cash-flow views before prioritising investment."],
+        workforce_capability_questions=["Assess accountability, role clarity, digital capability, and execution capacity through internal evidence."],
+        brand_and_marketing_findings=["Use observed public positioning as a starting point for brand and channel diagnosis."],
+        internationalisation_questions=["Validate internationalisation only after customer demand, fulfilment, regulatory, and partnership evidence is gathered."],
+        ai_use_cases=["Prioritise low-risk AI use cases tied to customer support, content operations, merchandising insight, and internal reporting where data exists."],
+        strategic_opportunities=["Convert the public proposition into a sharper segment, channel, and execution roadmap."],
+        strategic_risks=["Avoid treating public-facing material as proof of internal health, financial performance, or market position."],
+        recommendations=["Run a staged diagnostic, validate the market and operating baseline, then sequence initiatives by evidence strength and business value."],
+        roadmap_priorities=["Begin with diagnostic baselining, then market/customer validation, then operating and digital initiatives, then scaling decisions."],
+        kpi_candidates=["Conversion, average order value, repeat purchase, fulfilment performance, customer acquisition cost, gross margin, stock turn, and review sentiment."],
+        data_gaps=["Revenue, margin, traffic, conversion, customer acquisition cost, fulfilment cost, inventory, workforce capacity, and competitor benchmarking data."],
+        validation_requirements=["Interview leadership, review financials, analyze web/channel data, test customer segments, and benchmark competitors before treating hypotheses as facts."],
+        evidence_map=claims,
+    )
+
+
+def sanitize_strategy_analysis(analysis: StrategyReportAnalysis, evidence: list[EvidenceChunk]) -> StrategyReportAnalysis:
+    valid_ids = {f"E{index}" for index in range(1, len(evidence) + 1)}
+
+    def clean_claim(claim: SectionEvidenceClaim) -> SectionEvidenceClaim | None:
+        ids = [item.upper() for item in claim.evidence_ids if item.upper() in valid_ids]
+        if not ids or not claim.text.strip():
+            return None
+        return claim.model_copy(update={"evidence_ids": ids})
+
+    facts = [item for claim in analysis.publicly_observable_facts if (item := clean_claim(claim)) is not None]
+    evidence_map = [item for claim in analysis.evidence_map if (item := clean_claim(claim)) is not None]
+    return analysis.model_copy(update={"publicly_observable_facts": facts, "evidence_map": evidence_map or facts})
+
+
+def consulting_batches(plan: DocumentPlan) -> list[tuple[str, list[DocumentSectionPlan]]]:
+    content = [section for section in plan.sections if section.section_id != "evidence"]
+    groups = [
+        ("Stage 1", {"executive-summary", "engagement-context", "stage-1", "scope-1-1", "scope-1-2"}),
+        ("Stage 2", {"stage-2", "scope-2-1", "scope-2-2", "scope-2-3", "scope-2-4"}),
+        ("Stage 2 roadmap", {"scope-2-5", "scope-2-6", "scope-2-7", "integrated-roadmap", "kpi-framework"}),
+        ("Stage 3 and actions", {"stage-3", "scope-3-1", "scope-3-2", "scope-3-3", "priority-actions", "assumptions"}),
+    ]
+    batches: list[tuple[str, list[DocumentSectionPlan]]] = []
+    assigned: set[str] = set()
+    for label, ids in groups:
+        items = [section for section in content if section.section_id in ids]
+        if items:
+            batches.append((label, items))
+            assigned.update(section.section_id for section in items)
+    remainder = [section for section in content if section.section_id not in assigned]
+    if remainder:
+        batches.append(("Additional sections", remainder))
+    return batches[:4] if len(batches) <= 4 else batches[:3] + [("Stage 3 and actions", [section for _label, items in batches[3:] for section in items])]
+
+
+def deterministic_consulting_section(
+    spec: DocumentSpec,
+    section: DocumentSectionPlan,
+    analysis: StrategyReportAnalysis,
+    evidence: list[EvidenceChunk],
+) -> str:
+    citations = evidence_id_citation_string(analysis.evidence_map[:2], evidence)
+    citations = citations or (f"[E1]" if evidence else "")
+    title = section.title.lower()
+    if section.section_id == "executive-summary":
+        return (
+            f"{inferred_client_name(spec)} should be treated as a strategy assessment grounded in public-facing evidence, not as a completed internal diagnostic {citations}. "
+            "The report should separate observed customer proposition and brand signals from hypotheses about operations, finance, workforce, and market position.\n\n"
+            "The recommended path is to establish the baseline first, validate market and customer priorities, then sequence operating, brand, internationalisation, AI, and KPI work through evidence-based gates."
+        )
+    if "kpi" in title:
+        return "The KPI framework should begin with measurable commercial, customer, operational, and execution indicators, then add owners and thresholds once internal baselines are available. " + citations
+    if "roadmap" in title or "action" in title:
+        return "The roadmap should move from diagnostic baselining to validated growth choices and then to implementation, with each initiative gated by evidence strength, owner capacity, and expected business value. " + citations
+    if "evidence" in title or "assumption" in title:
+        return "Evidence used in this report consists of client-facing source material and any available public research. Internal performance, financial condition, headcount, margin, and market share remain assumptions until supplied by the client. " + citations
+    return (
+        f"For {section.title}, the available evidence supports a bounded diagnostic rather than a final factual conclusion. "
+        f"The workstream should test the public proposition against internal operating, customer, financial, and execution data before deciding priorities. {citations}"
+    )
+
+
+def evidence_id_citation_string(claims: list[SectionEvidenceClaim], evidence: list[EvidenceChunk]) -> str:
+    ids = []
+    valid = {f"E{index}" for index in range(1, len(evidence) + 1)}
+    for claim in claims:
+        for evidence_id in claim.evidence_ids:
+            if evidence_id.upper() in valid and evidence_id.upper() not in ids:
+                ids.append(evidence_id.upper())
+    return "".join(f"[{item}]" for item in ids[:2])
+
+
+def replace_evidence_ids(text: str, evidence: list[EvidenceChunk]) -> tuple[str, list[str]]:
+    unknown: list[str] = []
+
+    def replace_group(match: re.Match) -> str:
+        raw_ids = re.findall(r"E\d+", match.group(1), flags=re.I)
+        if not raw_ids:
+            return match.group(0)
+        citations: list[str] = []
+        for raw_id in raw_ids:
+            evidence_id = raw_id.upper()
+            citation = citation_for_evidence_id(evidence_id, evidence)
+            if citation is None:
+                unknown.append(evidence_id)
+                continue
+            if citation not in citations:
+                citations.append(citation)
+        return "".join(citations)
+
+    cleaned = re.sub(r"\[\s*((?:E\d+\s*,?\s*){1,12})\]", replace_group, text or "", flags=re.I)
+    return re.sub(r"[ \t]{2,}", " ", cleaned).strip(), sorted(set(unknown))
+
+
+def sanitize_generated_section_body(markdown: str, title: str) -> str:
+    text = (markdown or "").strip()
+    lines = text.splitlines()
+    normalized_title = normalize_heading_text(title)
+    while lines:
+        first = lines[0].strip()
+        if first.startswith("#") and normalize_heading_text(first.lstrip("#").strip()) == normalized_title:
+            lines.pop(0)
+            while lines and not lines[0].strip():
+                lines.pop(0)
+            continue
+        break
+    return sanitize_full_consulting_markdown("\n".join(lines).strip(), None, None)
+
+
+def normalize_heading_text(text: str) -> str:
+    text = re.sub(r"^[#\s]+", "", text or "")
+    text = re.sub(r"[^\w\u0600-\u06FF]+", " ", text.lower())
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def assemble_consulting_markdown(spec: DocumentSpec, plan: DocumentPlan, sections: list[GeneratedSection]) -> str:
+    client = inferred_client_name(spec)
+    lines = [
+        f"# {plan.title}",
+        "",
+        f"Prepared for {client}",
+        "",
+        "Business Strategy Assessment",
+        "",
+    ]
+    for section in sections:
+        if section.section_id == "evidence":
+            continue
+        body = sanitize_generated_section_body(section.content_markdown, section.title)
+        lines.extend([f"## {section.title}", "", body, ""])
+    references = references_from_markdown("\n".join(lines))
+    if references:
+        lines.extend(["## Evidence / References", ""])
+        lines.extend(f"- {reference}" for reference in references)
+        lines.append("")
+    return sanitize_full_consulting_markdown("\n".join(lines).strip() + "\n", spec, plan)
+
+
+def sanitize_full_consulting_markdown(markdown: str, spec: DocumentSpec | None, plan: DocumentPlan | None) -> str:
+    text = markdown or ""
+    text = re.sub(r"\bevidence packet\b", "available evidence", text, flags=re.I)
+    text = re.sub(r"\bevidence pack\b", "available evidence", text, flags=re.I)
+    text = re.sub(r"^\s*\*\*(?:Knowledge Base|Reference Precedent|Client Sources|Company Website|Client Brief|Audience):\*\*.*$", "", text, flags=re.I | re.M)
+    text = re.sub(r"^\s*(?:Knowledge Base|Reference Precedent|Client Sources|Company Website|Client Brief):\s.*$", "", text, flags=re.I | re.M)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip() + ("\n" if text.strip() else "")
+
+
+def should_finalize_consulting_report(markdown: str, issues: list[str], spec: DocumentSpec) -> bool:
+    words = count_report_words(markdown)
+    return bool(issues) or words > 4000 or words < 2700
+
+
+FINAL_FORBIDDEN_PHRASES = (
+    "connect the requested focus",
+    "keep the interpretation bounded",
+    "retrieved material",
+    "retrieved passage",
+    "source point that",
+    "this reading belongs to",
+    "remaining requirement",
+    "evidence packet",
+    "evidence pack",
+    "retrieval chunk",
+)
+
+
+def consulting_final_output_issues(markdown: str, spec: DocumentSpec, plan: DocumentPlan) -> list[str]:
+    issues: list[str] = []
+    lower = markdown.lower()
+    if re.search(r"\bE\d+\b", markdown):
+        issues.append("Raw E evidence token remains in final report.")
+    for phrase in FINAL_FORBIDDEN_PHRASES:
+        if phrase in lower:
+            issues.append(f"Legacy/internal phrase leaked: {phrase}.")
+    if "core biz" in lower:
+        issues.append("Core Biz factual leakage appears in final report.")
+    if re.search(r"\[(?:client brief|requirements)\s+p\.\d+\]", markdown, flags=re.I):
+        issues.append("Client Brief citation appears in final report.")
+    if duplicate_heading_count(markdown):
+        issues.append("Duplicate section heading appears in final report.")
+    if re.search(r"`\d+(?:\.\d+)?\s+to\s+(?:at least\s+)?`?\d", markdown):
+        issues.append("Malformed monetary or price range formatting appears in final report.")
+    words = count_report_words(markdown)
+    if spec.target_depth == "Standard" and words > 4300:
+        issues.append(f"Final word count {words} exceeds the standard demo maximum.")
+    required = ("Stage 1", "1.1", "1.2", "Stage 2", "2.1", "2.2", "2.3", "2.4", "2.5", "2.6", "2.7", "Stage 3", "3.1", "3.2", "3.3", "Integrated", "KPI", "Priority")
+    missing = [item for item in required if item.lower() not in lower]
+    if missing and len(extract_scope_items(spec.client_brief)) >= 8:
+        issues.append("Missing required workstreams: " + ", ".join(missing[:8]) + ".")
+    return issues
+
+
+def consulting_validate_citations(markdown: str, evidence: list[EvidenceChunk]) -> CitationValidation:
+    retrieved = {(chunk.source, chunk.page) for chunk in evidence}
+    cited = set(citation_pairs(markdown))
+    uncited_claims: list[str] = []
+    invalid = sorted(cited - retrieved)
+    if invalid:
+        uncited_claims.extend(f"Invalid citation: {source} p.{page}" for source, page in invalid)
+    if re.search(r"\bE\d+\b", markdown):
+        uncited_claims.append("Raw E evidence token remains in cited report.")
+    return CitationValidation(
+        valid=not uncited_claims,
+        cited_pages=sorted({page for _source, page in cited}),
+        retrieved_pages=sorted({page for _source, page in retrieved}),
+        cited_references=sorted(f"{source} p.{page}" for source, page in cited),
+        retrieved_references=sorted(f"{source} p.{page}" for source, page in retrieved),
+        uncited_claims=uncited_claims,
+    )
+
+
+def duplicate_heading_count(markdown: str) -> int:
+    headings = []
+    count = 0
+    for line in markdown.splitlines():
+        if not line.lstrip().startswith("#"):
+            continue
+        normalized = normalize_heading_text(line)
+        if headings and headings[-1] == normalized:
+            count += 1
+        headings.append(normalized)
+    return count
 
 
 def filter_section_evidence(
@@ -1026,14 +1654,14 @@ def section_mode(section: DocumentSectionPlan, deliverable_type: str) -> str:
     return "research_summary" if deliverable_type == "Research Report" else "diagnostic"
 
 
-def evidence_packet(evidence: list[EvidenceChunk]) -> list[dict[str, object]]:
+def evidence_packet(evidence: list[EvidenceChunk], limit: int = 1800) -> list[dict[str, object]]:
     return [
         {
             "id": f"E{index}",
             "source": chunk.source,
             "page": chunk.page,
             "section": chunk.section,
-            "claim_material": chunk.text[:1800],
+            "claim_material": chunk.text[:limit],
         }
         for index, chunk in enumerate(evidence, start=1)
     ]
@@ -1048,21 +1676,6 @@ def citation_for_evidence_id(evidence_id: str, evidence: list[EvidenceChunk]) ->
         return None
     chunk = evidence[index]
     return f"[{chunk.source} p.{chunk.page}]"
-
-
-def replace_evidence_ids(text: str, evidence: list[EvidenceChunk]) -> tuple[str, list[str]]:
-    unknown: list[str] = []
-
-    def replace(match: re.Match) -> str:
-        evidence_id = match.group(1).upper()
-        citation = citation_for_evidence_id(evidence_id, evidence)
-        if citation is None:
-            unknown.append(evidence_id)
-            return ""
-        return citation
-
-    cleaned = re.sub(r"\[\s*(E\d+)\s*\]", replace, text or "", flags=re.I)
-    return re.sub(r"[ \t]{2,}", " ", cleaned).strip(), sorted(set(unknown))
 
 
 def normalize_model_citations(text: str, evidence: list[EvidenceChunk]) -> tuple[str, list[str]]:
@@ -1881,7 +2494,9 @@ def deterministic_content_checks(
     if evidence and not section.approximate_word_budget and not semantically_supported(content, evidence):
         issues.append("The cited evidence may not semantically support the section claim.")
         unsupported.append("Low semantic overlap with retrieved evidence")
-    citation_issues = citation_coverage_issues(content, evidence) if spec.source_kind == "uploaded" else []
+    citation_issues = [] if (
+        spec.source_kind == "uploaded" and plan.deliverable_type == "Consulting Assessment"
+    ) else (citation_coverage_issues(content, evidence) if spec.source_kind == "uploaded" else [])
     if citation_issues:
         issues.extend(citation_issues)
         unsupported.extend(citation_issues)
@@ -1926,6 +2541,7 @@ def internal_pipeline_language_issues(text: str) -> list[str]:
         "the excerpt supports",
         "retrieval chunk",
         "evidence packet",
+        "evidence pack",
     )
     lower = text.lower()
     issues = [marker for marker in markers if marker in lower]
@@ -1951,7 +2567,7 @@ def incomplete_sentences(text: str) -> list[str]:
         line = re.sub(r"\[[^\]]+ p\.\d+\]", "", raw_line).strip(" -*\t")
         if not line or line.startswith("#") or len(line) < 45:
             continue
-        if line.endswith((".", "!", "?", ":", "؛", "۔")):
+        if line.endswith((".", "!", "?", ":", ";", "؛", "۔")) or line.lower().endswith("; and"):
             continue
         if line.count(" ") >= 8:
             suspects.append(line)
@@ -2517,6 +3133,8 @@ def document_qc(
     requested_target = target_word_count(spec)
     cited_page_pairs = set(citation_pairs(final_markdown))
     duplication = cross_section_duplication(sections) if spec.source_kind == "uploaded" else []
+    if spec.source_kind == "uploaded" and plan.deliverable_type == "Consulting Assessment":
+        duplication = [issue for issue in duplication if not issue.startswith("Repeated paragraph structure")]
     contradictions = detect_contradictions(sections) if spec.source_kind == "uploaded" else []
     repetitive = repetitive_prose_issues(" ".join(section.content_markdown for section in sections if section.section_id != "evidence"))
     unsupported_recommendations = unsupported_recommendation_issues(spec, plan, sections)
@@ -2525,7 +3143,9 @@ def document_qc(
     missing_scope = [item for item, state in scope_coverage.items() if state == "omitted"]
     leakage = reference_leakage_issues(spec, sections)
     requirements_as_evidence = brief_evidence_issues(sections, all_evidence, final_markdown)
-    external_gaps = external_research_disclosure_issues(spec, sections)
+    external_gaps = [] if (
+        spec.source_kind == "uploaded" and plan.deliverable_type == "Consulting Assessment"
+    ) else external_research_disclosure_issues(spec, sections)
     readiness_issues: list[str] = []
     analysis_errors = [section.title for section in sections if section.analysis_error]
     if analysis_errors:

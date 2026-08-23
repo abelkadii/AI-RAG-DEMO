@@ -39,10 +39,13 @@ def docx_bytes(trace: DocumentTrace) -> bytes:
 
     subtitle = document.add_paragraph()
     subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    subtitle.add_run(f"Knowledge Base: {trace.spec.knowledge_base}")
-
-    document.add_paragraph(f"Audience: {trace.spec.audience}")
-    document.add_paragraph(f"Client Brief: {trace.spec.client_brief}")
+    if trace.spec.source_kind == "uploaded" and trace.plan.deliverable_type == "Consulting Assessment":
+        subtitle.add_run("Business Strategy Assessment")
+        document.add_paragraph(f"Prepared for {trace.plan.title.replace(' Business Strategy Report', '')}")
+    else:
+        subtitle.add_run(f"Knowledge Base: {trace.spec.knowledge_base}")
+        document.add_paragraph(f"Audience: {trace.spec.audience}")
+        document.add_paragraph(f"Client Brief: {trace.spec.client_brief}")
 
     for section_trace in trace.sections:
         if section_trace.section_id == "evidence":
@@ -120,16 +123,22 @@ def _monochrome_pdf_bytes(trace: DocumentTrace) -> bytes:
     cover = pdf.new_page(width=page_width, height=page_height)
     cover.insert_text((margin, 150), trace.plan.title, fontsize=26, fontname="hebo", color=(0, 0, 0))
     cover.draw_line((margin, 175), (page_width - margin, 175), color=(0, 0, 0), width=1.4)
-    cover.insert_text((margin, 205), "Evidence-grounded strategy deliverable", fontsize=12, fontname="hebo", color=(0.25, 0.25, 0.25))
-    cover.insert_text((margin, 260), f"Audience: {trace.spec.audience}", fontsize=10, fontname="helv", color=(0.2, 0.2, 0.2))
-    cover.insert_text((margin, 280), f"Reference precedent: {', '.join(trace.spec.reference_source_names) if trace.spec.reference_source_names else 'None'}", fontsize=10, fontname="helv", color=(0.2, 0.2, 0.2))
-    client_sources = ", ".join(trace.spec.client_source_names) if trace.spec.client_source_names else (
-        "No client PDFs; website/public evidence only" if trace.spec.source_kind == "uploaded" else "AWS sample corpus"
-    )
-    cover.insert_text((margin, 300), f"Client sources: {client_sources}", fontsize=10, fontname="helv", color=(0.2, 0.2, 0.2))
-    if trace.spec.company_website:
-        cover.insert_text((margin, 320), f"Website context: {trace.spec.company_website}", fontsize=10, fontname="helv", color=(0.2, 0.2, 0.2))
-    cover.insert_textbox(pymupdf.Rect(margin, 680, page_width - margin, 735), "Prepared from selected client evidence and explicitly stated requirements. Reference documents inform structure and presentation only.", fontsize=9, fontname="helv", color=(0.25, 0.25, 0.25))
+    if trace.spec.source_kind == "uploaded" and trace.plan.deliverable_type == "Consulting Assessment":
+        client = trace.plan.title.replace(" Business Strategy Report", "")
+        cover.insert_text((margin, 205), f"Prepared for {client}", fontsize=12, fontname="hebo", color=(0.25, 0.25, 0.25))
+        cover.insert_text((margin, 235), "Business Strategy Assessment", fontsize=11, fontname="helv", color=(0.2, 0.2, 0.2))
+        cover.insert_textbox(pymupdf.Rect(margin, 680, page_width - margin, 735), "Prepared from selected client evidence, stated requirements, and cited public material.", fontsize=9, fontname="helv", color=(0.25, 0.25, 0.25))
+    else:
+        cover.insert_text((margin, 205), "Evidence-grounded strategy deliverable", fontsize=12, fontname="hebo", color=(0.25, 0.25, 0.25))
+        cover.insert_text((margin, 260), f"Audience: {trace.spec.audience}", fontsize=10, fontname="helv", color=(0.2, 0.2, 0.2))
+        cover.insert_text((margin, 280), f"Reference precedent: {', '.join(trace.spec.reference_source_names) if trace.spec.reference_source_names else 'None'}", fontsize=10, fontname="helv", color=(0.2, 0.2, 0.2))
+        client_sources = ", ".join(trace.spec.client_source_names) if trace.spec.client_source_names else (
+            "No client PDFs; website/public evidence only" if trace.spec.source_kind == "uploaded" else "AWS sample corpus"
+        )
+        cover.insert_text((margin, 300), f"Client sources: {client_sources}", fontsize=10, fontname="helv", color=(0.2, 0.2, 0.2))
+        if trace.spec.company_website:
+            cover.insert_text((margin, 320), f"Website context: {trace.spec.company_website}", fontsize=10, fontname="helv", color=(0.2, 0.2, 0.2))
+        cover.insert_textbox(pymupdf.Rect(margin, 680, page_width - margin, 735), "Prepared from selected client evidence and explicitly stated requirements. Reference documents inform structure and presentation only.", fontsize=9, fontname="helv", color=(0.25, 0.25, 0.25))
 
     page = pdf.new_page(width=page_width, height=page_height)
     y = margin
