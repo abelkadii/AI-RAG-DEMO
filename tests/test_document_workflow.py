@@ -1,5 +1,5 @@
 from document_export import docx_bytes, markdown_bytes, pdf_bytes
-from document_models import DocumentSpec, SectionQC
+from document_models import DocumentSpec, GeneratedSection, SectionQC
 from document_workflow import (
     DEFAULT_BRIEF,
     DocumentWorkflow,
@@ -9,10 +9,15 @@ from document_workflow import (
     DEPTH_PROFILES,
     explicit_word_count,
     target_word_count,
+    extract_scope_items,
+    analyze_reference_report,
+    reference_leakage_issues,
 )
 from llm import LocalReasoner
-from models import EvidenceChunk
+from models import AgentTrace, EvidenceChunk
 from uploaded_corpus import clean_uploaded_text, diversify_results, extract_pdf_bytes
+from website_context import fetch_website_evidence
+from streamlit_app import MAX_BRIEF_LENGTH
 
 
 class DocumentFakeRetriever:
@@ -265,9 +270,60 @@ def test_depth_profiles_and_explicit_word_count_are_independent_from_deliverable
         deliverable_type="Curriculum / Teaching Material",
         target_depth="Brief",
     )
-    assert DEPTH_PROFILES["Detailed"][0] == 3000
+    assert DEPTH_PROFILES["Detailed"][1] == (5000, 8000)
     assert explicit_word_count(spec.client_brief) == 3000
     assert target_word_count(spec) == 3000
+
+
+def test_long_brief_survives_document_spec_without_truncation():
+    brief = "Speckled Space scope\n" + ("Validate the proposed strategic workstream and evidence boundary. " * 250)
+    assert len(brief) > 10000
+    spec = DocumentSpec(client_brief=brief, source_kind="uploaded")
+    assert spec.client_brief == brief
+    assert len(spec.client_brief) == len(brief)
+    assert MAX_BRIEF_LENGTH >= 40000
+
+
+def test_website_context_rejects_unbounded_or_insecure_urls_gracefully():
+    chunks, notice = fetch_website_evidence("http://example.com")
+    assert chunks == []
+    assert notice
+
+
+def test_stage_scope_is_preserved_in_strategy_plan():
+    brief = """Create a new business strategy report.\n\nStage 1 — Business Diagnostic & Competitive Landscape\n1.1 Organisational Health Check & Operating Model Review — assess structure and workflows.\n1.2 Competitive Landscape & Market Positioning Assessment — benchmark positioning.\n\nStage 2 — Strategic Planning & Business Development\n2.1 Market & Customer Intelligence — segment and size opportunities.\n2.6 AI Integration Review & Adoption Roadmap — prioritize use cases.\n2.7 Strategic Roadmap & Comprehensive Action Plan — define KPIs.\n\nStage 3 — Training, Implementation Planning & Knowledge Transfer\n3.1 Strategic Frameworks & Execution Training Workshop\n3.2 AI-Enabled Process & Digital Tools Workshop\n3.3 Playbooks, Change Readiness & Project Closure"""
+    spec = DocumentSpec(client_brief=brief, source_kind="uploaded", target_depth="Detailed", deliverable_type="Auto")
+    plan = make_workflow().plan(spec, [])
+    titles = " ".join(section.title for section in plan.sections)
+    for marker in ("Stage 1", "1.1", "1.2", "Stage 2", "2.1", "2.6", "2.7", "Stage 3", "3.1", "3.2", "3.3"):
+        assert marker in titles
+    assert len(extract_scope_items(brief)) >= 10
+    assert plan.deliverable_type == "Consulting Assessment"
+
+
+def test_reference_profile_is_structure_only_and_old_client_name_is_checked():
+    class Reference:
+        chunks = [EvidenceChunk(chunk_id="ref-1", page=1, text="Executive Summary\nRecommendations\nRoadmap and KPI matrix", source="Core Biz Holdings - Business Strategy EDG Report V2.pdf")]
+
+    reference = Reference()
+    profile = analyze_reference_report(reference)
+    assert profile.approximate_word_count >= 1
+    assert profile.title
+    clean_spec = DocumentSpec(
+        client_brief="Create a new strategy report for Speckled Space.",
+        source_kind="uploaded",
+        reference_source_names=["Core Biz Holdings - Business Strategy EDG Report V2.pdf"],
+    )
+    assert reference_leakage_issues(clean_spec, []) == []
+    leaked = GeneratedSection(
+        section_id="findings",
+        title="Findings",
+        objective="Assess the new client.",
+        content_markdown="Core Biz Holdings has established this operating model.",
+        research_trace=AgentTrace(question="findings"),
+        qc=SectionQC(passed=True),
+    )
+    assert reference_leakage_issues(clean_spec, [leaked]) == clean_spec.reference_source_names
 
 
 def test_detailed_curriculum_plan_has_meaningful_sections_and_research_questions():

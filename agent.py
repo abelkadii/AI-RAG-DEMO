@@ -58,7 +58,14 @@ class Agent:
             stripped = line.strip()
             if not stripped:
                 continue
-            if stripped.startswith("#") or stripped.startswith(("**Knowledge Base:**", "**Audience:**", "**Client Brief:**")):
+            if stripped.startswith("#") or stripped.startswith((
+                "**Knowledge Base:**",
+                "**Audience:**",
+                "**Client Brief:**",
+                "**Reference Precedent:**",
+                "**Client Sources:**",
+                "**Company Website:**",
+            )):
                 continue
             is_heading = stripped.endswith(":") or len(stripped.split()) <= 4 and not stripped.endswith((".", "]"))
             if is_heading:

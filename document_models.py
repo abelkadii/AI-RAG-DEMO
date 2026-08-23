@@ -17,7 +17,7 @@ class DocumentSpec(BaseModel):
     # ``Demo`` is retained as a compatibility value for older traces and API
     # callers.  The public UI exposes the four production depth profiles.
     target_depth: Literal["Brief", "Standard", "Detailed", "Comprehensive", "Demo"] = "Standard"
-    target_word_count: int | None = Field(default=None, ge=100, le=10000)
+    target_word_count: int | None = Field(default=None, ge=100, le=50000)
     knowledge_base: str = "AWS Well-Architected Framework"
     source_kind: Literal["aws_sample", "uploaded"] = "aws_sample"
     deliverable_type: Literal[
@@ -28,6 +28,24 @@ class DocumentSpec(BaseModel):
         "Curriculum / Teaching Material",
         "Custom",
     ] = "Auto"
+    reference_source_names: list[str] = Field(default_factory=list)
+    client_source_names: list[str] = Field(default_factory=list)
+    company_website: str | None = None
+
+
+class ReferenceReportProfile(BaseModel):
+    """A style/structure blueprint; it is never used as client evidence."""
+
+    title: str = ""
+    detected_sections: list[str] = Field(default_factory=list)
+    section_patterns: list[str] = Field(default_factory=list)
+    approximate_word_count: int = 0
+    tone: str = "formal consulting"
+    analytical_frameworks: list[str] = Field(default_factory=list)
+    recurring_output_types: list[str] = Field(default_factory=list)
+    roadmap_pattern: str | None = None
+    tables_or_matrices: list[str] = Field(default_factory=list)
+    presentation_notes: list[str] = Field(default_factory=list)
 
 
 class DocumentSectionPlan(BaseModel):
@@ -53,6 +71,8 @@ class DocumentPlan(BaseModel):
     target_word_count: int | None = None
     source_survey: list[EvidenceChunk] = Field(default_factory=list)
     source_topics: list[str] = Field(default_factory=list)
+    reference_profile: ReferenceReportProfile | None = None
+    scope_requirements: list[str] = Field(default_factory=list)
 
 
 class SectionQC(BaseModel):
@@ -92,6 +112,8 @@ class DocumentQC(BaseModel):
     cross_section_duplication: list[str] = Field(default_factory=list)
     contradictions: list[str] = Field(default_factory=list)
     unsupported_recommendations: list[str] = Field(default_factory=list)
+    missing_scope_requirements: list[str] = Field(default_factory=list)
+    reference_leakage: list[str] = Field(default_factory=list)
 
 
 class DocumentTrace(BaseModel):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from io import BytesIO
 import re
+import textwrap
 
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -78,6 +79,10 @@ def docx_bytes(trace: DocumentTrace) -> bytes:
 
 
 def pdf_bytes(trace: DocumentTrace) -> bytes:
+    return _monochrome_pdf_bytes(trace)
+
+
+def _legacy_pdf_bytes(trace: DocumentTrace) -> bytes:
     """Render a lightweight, dependency-free PDF from the final Markdown."""
     pdf = pymupdf.open()
     page = pdf.new_page(width=595, height=842)
@@ -105,6 +110,50 @@ def pdf_bytes(trace: DocumentTrace) -> bytes:
         if y > 790:
             page = pdf.new_page(width=595, height=842)
             y = margin
+    return pdf.tobytes()
+
+
+def _monochrome_pdf_bytes(trace: DocumentTrace) -> bytes:
+    """Render a restrained monochrome consulting-style PDF with page numbers."""
+    pdf = pymupdf.open()
+    page_width, page_height, margin = 595, 842, 54
+    cover = pdf.new_page(width=page_width, height=page_height)
+    cover.insert_text((margin, 150), trace.plan.title, fontsize=26, fontname="hebo", color=(0, 0, 0))
+    cover.draw_line((margin, 175), (page_width - margin, 175), color=(0, 0, 0), width=1.4)
+    cover.insert_text((margin, 205), "Evidence-grounded strategy deliverable", fontsize=12, fontname="hebo", color=(0.25, 0.25, 0.25))
+    cover.insert_text((margin, 260), f"Audience: {trace.spec.audience}", fontsize=10, fontname="helv", color=(0.2, 0.2, 0.2))
+    cover.insert_text((margin, 280), f"Reference precedent: {', '.join(trace.spec.reference_source_names) if trace.spec.reference_source_names else 'None'}", fontsize=10, fontname="helv", color=(0.2, 0.2, 0.2))
+    cover.insert_text((margin, 300), f"Client sources: {', '.join(trace.spec.client_source_names) if trace.spec.client_source_names else 'Client brief'}", fontsize=10, fontname="helv", color=(0.2, 0.2, 0.2))
+    if trace.spec.company_website:
+        cover.insert_text((margin, 320), f"Website context: {trace.spec.company_website}", fontsize=10, fontname="helv", color=(0.2, 0.2, 0.2))
+    cover.insert_textbox(pymupdf.Rect(margin, 680, page_width - margin, 735), "Prepared from selected client evidence and explicitly stated requirements. Reference documents inform structure and presentation only.", fontsize=9, fontname="helv", color=(0.25, 0.25, 0.25))
+
+    page = pdf.new_page(width=page_width, height=page_height)
+    y = margin
+    for raw in trace.final_markdown.splitlines():
+        text = raw.strip()
+        if not text:
+            y += 8
+            continue
+        if text.startswith("# "):
+            size, text = 20, text[2:]
+        elif text.startswith("## "):
+            size, text = 14, text[3:]
+        else:
+            size = 9.5
+            if text.startswith("- "):
+                text = "- " + text[2:]
+        wrapped = textwrap.wrap(text, width=92) or [""]
+        line_height = max(15, size * 1.55)
+        if y + line_height * len(wrapped) > page_height - 55:
+            page = pdf.new_page(width=page_width, height=page_height)
+            y = margin
+        for line in wrapped:
+            page.insert_text((margin, y), line, fontsize=size, fontname="hebo" if size >= 14 else "helv", color=(0, 0, 0) if size >= 14 else (0.12, 0.12, 0.12))
+            y += line_height
+        y += 5
+    for index, item in enumerate(pdf, start=1):
+        item.insert_text((page_width - 75, page_height - 28), str(index), fontsize=8, fontname="helv", color=(0.35, 0.35, 0.35))
     return pdf.tobytes()
 
 

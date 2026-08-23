@@ -22,8 +22,11 @@ Source Knowledge + Client Brief
 The default Streamlit experience is **Document Studio**, which can generate either an AWS Well-Architected assessment from the built-in sample corpus or a generic evidence-grounded report from uploaded PDFs. It includes:
 
 - editable report title, brief, audience, deliverable type, and target depth;
-- independent depth profiles: Brief (500–800 words), Standard (1,200–2,000), Detailed (2,500–4,000), and Comprehensive (4,000–7,000);
+- independent depth profiles: Brief (500–800 words), Standard (2,500–4,000), Detailed (5,000–8,000), and Comprehensive (8,000–12,000);
 - explicit brief word counts take precedence over the selected depth;
+- long client briefs up to 50,000 characters;
+- optional reference/predecessor PDFs used for structure and style only, kept separate from client evidence;
+- optional bounded same-domain website context for the client source side;
 - a source selector for the built-in AWS sample or uploaded PDF documents;
 - source surveying followed by section-level, multi-question research traces;
 - source/page cited report sections, such as `[AWS Well-Architected Framework p.303]` or `[Strategy_Report.pdf p.12]`;

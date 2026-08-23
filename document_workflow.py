@@ -15,6 +15,7 @@ from document_models import (
     DocumentSpec,
     DocumentTrace,
     GeneratedSection,
+    ReferenceReportProfile,
     SectionQC,
 )
 from llm import Reasoner, configured_reasoner
@@ -33,9 +34,9 @@ DEFAULT_BRIEF = (
 
 DEPTH_PROFILES: dict[str, tuple[int, tuple[int, int]]] = {
     "Brief": (650, (500, 800)),
-    "Standard": (1600, (1200, 2000)),
-    "Detailed": (3000, (2500, 4000)),
-    "Comprehensive": (5500, (4000, 7000)),
+    "Standard": (3250, (2500, 4000)),
+    "Detailed": (6500, (5000, 8000)),
+    "Comprehensive": (10000, (8000, 12000)),
 }
 
 
@@ -113,6 +114,83 @@ def source_topic_labels(survey: list[EvidenceChunk]) -> list[str]:
     return labels
 
 
+def extract_scope_items(brief: str) -> list[str]:
+    """Capture explicit Stage/numbered scope lines without treating them as facts."""
+    items: list[str] = []
+    for line in (brief or "").splitlines():
+        cleaned = re.sub(r"\s+", " ", line).strip(" -*\t")
+        if re.match(r"^Stage\s+\d+", cleaned, flags=re.I) or re.match(r"^\d+(?:\.\d+)?(?:\s|$)", cleaned):
+            items.append(cleaned)
+    return items
+
+
+def analyze_reference_report(retriever) -> ReferenceReportProfile:
+    """Extract a compact precedent blueprint from reference chunks only."""
+    chunks = list(getattr(retriever, "chunks", getattr(getattr(retriever, "store", None), "chunks", [])))
+    if not chunks:
+        return ReferenceReportProfile()
+    source = chunks[0].source
+    text = " ".join(chunk.text for chunk in chunks)
+    sections: list[str] = []
+    for chunk in chunks:
+        for line in re.split(r"\n|(?<=[.!?])\s+", chunk.text):
+            candidate = re.sub(r"\s+", " ", line).strip(" -•")
+            if 2 <= len(candidate.split()) <= 12 and (
+                re.match(r"^(?:\d+(?:\.\d+)*|chapter|stage|executive|conclusion|recommend|roadmap|appendix)", candidate, flags=re.I)
+                or candidate.isupper()
+            ):
+                if candidate not in sections:
+                    sections.append(candidate)
+    frameworks = [name for name in ("SWOT", "PESTEL", "BCG", "business model canvas", "KPI", "roadmap", "risk matrix") if name.lower() in text.lower()]
+    outputs = [name for name in ("recommendations", "roadmap", "action plan", "KPI", "risk register", "market analysis") if name.lower() in text.lower()]
+    tables = [name for name in ("table", "matrix", "scorecard", "dashboard") if name.lower() in text.lower()]
+    return ReferenceReportProfile(
+        title=source,
+        detected_sections=sections[:30],
+        section_patterns=["numbered section hierarchy" if any(re.match(r"^\d", item) for item in sections) else "narrative sections"],
+        approximate_word_count=count_words(text),
+        tone="formal consulting with structured analysis",
+        analytical_frameworks=frameworks,
+        recurring_output_types=outputs,
+        roadmap_pattern="phased roadmap" if "roadmap" in text.lower() else None,
+        tables_or_matrices=tables,
+        presentation_notes=["Use clear hierarchy, concise findings, and explicit action-oriented headings."],
+    )
+
+
+def scope_driven_definitions(brief: str, topic: str) -> list[tuple[str, str, str, list[str], list[str], int]]:
+    lines = extract_scope_items(brief)
+    definitions: list[tuple[str, str, str, list[str], list[str], int]] = [
+        ("executive-summary", "Executive Summary", "Set out the requested strategy engagement, decision context, and evidence boundaries.", ["What decision should the report support?", "Which findings are established, inferred, or proposed?"], ["summary", "scope"], 8),
+        ("engagement-context", "Engagement Context and Strategic Objectives", "Translate the new client context and scope of work into explicit objectives without asserting an undiagnosed condition.", [f"What is the requested context for {topic}?", "What objectives and boundaries govern the engagement?"], ["context", "objectives"], 8),
+    ]
+    current_stage: str | None = None
+    stage_index = 0
+    for line in lines:
+        is_stage = bool(re.match(r"^Stage\s+\d+", line, flags=re.I))
+        if is_stage:
+            stage_index += 1
+            current_stage = line
+            slug = f"stage-{stage_index}"
+            definitions.append((slug, line, f"Frame the requested work in {line} as a strategic workstream, preserving the client's scope without claiming the diagnostic is complete.", [f"What does {line} request?", "How should this workstream be assessed and connected to the wider strategy?"], ["stage", "scope"], 8))
+            continue
+        number = re.match(r"^(\d+(?:\.\d+)?)\s*(?:[^\w\s]+\s*)?(.+)$", line)
+        if not number:
+            continue
+        item_id = "scope-" + number.group(1).replace(".", "-")
+        title = f"{number.group(1)} {number.group(2).strip()}"
+        parent = current_stage or "the engagement"
+        definitions.append((item_id, title, f"Define the requested analysis and output for {title} within {parent}.", [f"What should the {title} workstream examine?", "Which evidence, assumptions, and validation questions are required?", "How does this workstream inform the strategic decision?"], ["scope", "analysis"], 12))
+    if any(term in brief.lower() for term in ("roadmap", "action plan", "3–5 year", "3-5 year")):
+        definitions.append(("integrated-roadmap", "Integrated 3–5 Year Roadmap", "Sequence requested strategic initiatives as a proposed roadmap, clearly separating recommendations from established facts.", ["What sequencing is requested?", "Which dependencies and validation gates should guide the roadmap?"], ["roadmap", "recommendations"], 10))
+    if "kpi" in brief.lower() or "measurement framework" in brief.lower():
+        definitions.append(("kpi-framework", "KPI / Measurement Framework", "Define a proposed measurement framework tied to the requested objectives and assumptions.", ["What outcomes should be measured?", "What baseline and ownership questions remain open?"], ["KPI", "measurement"], 8))
+    if any(term in brief.lower() for term in ("priority actions", "next steps", "action plan")):
+        definitions.append(("priority-actions", "Priority Actions and Next Steps", "Present evidence-grounded next steps and validation actions requested by the client.", ["Which actions are highest priority?", "What evidence or decision is needed before execution?"], ["priority", "actions"], 8))
+    definitions.append(("assumptions", "Evidence, Sources, and Assumptions", "Distinguish supplied evidence, analytical inference, and recommendations or hypotheses.", ["What is supported by client material?", "What must be validated before being treated as fact?"], ["evidence", "assumptions"], 6))
+    return definitions
+
+
 def merge_agent_traces(question: str, traces: list[AgentTrace]) -> AgentTrace:
     if not traces:
         return AgentTrace(question=question, stop_reason="no_evidence")
@@ -142,6 +220,13 @@ def citation_pairs(text: str) -> list[tuple[str, int]]:
 
 def count_words(text: str) -> int:
     return len(re.findall(r"[\w\u0600-\u06FF]+", re.sub(r"\[[^\]]+\]", "", text)))
+
+
+def count_report_words(markdown: str) -> int:
+    """Count generated section prose, excluding brief metadata/references."""
+    body = re.split(r"^##\s+", markdown, maxsplit=1, flags=re.M)[-1]
+    body = re.split(r"^Evidence / References\s*$", body, maxsplit=1, flags=re.M)[0]
+    return count_words(body)
 
 
 @dataclass(frozen=True)
@@ -179,6 +264,8 @@ class DocumentWorkflow:
         evidence_k: int = 8,
         section_writer: SectionWriter | None = None,
         qc_runner: QCRunner | None = None,
+        reference_retriever=None,
+        reference_profile: ReferenceReportProfile | None = None,
     ) -> None:
         self.retriever = retriever or Retriever()
         self.reasoner = reasoner or configured_reasoner()
@@ -186,6 +273,8 @@ class DocumentWorkflow:
         self.evidence_k = evidence_k
         self.section_writer = section_writer or EvidenceGroundedSectionWriter()
         self.qc_runner = qc_runner or DeterministicSectionQC()
+        self.reference_retriever = reference_retriever
+        self.reference_profile = reference_profile
 
     def plan(self, spec: DocumentSpec, survey: list[EvidenceChunk] | None = None) -> DocumentPlan:
         if spec.source_kind == "uploaded":
@@ -211,6 +300,7 @@ class DocumentWorkflow:
             target_word_count=target_word_count(spec),
             source_survey=serializable_evidence(survey or []),
             source_topics=source_topic_labels(survey or []),
+            reference_profile=self.reference_profile,
             sections=[
                 DocumentSectionPlan(
                     section_id=section_id,
@@ -245,6 +335,8 @@ class DocumentWorkflow:
                 ("major-themes", "Major Themes / Findings", "Summarize the major themes or findings without adding recommendations.", ["chapter headings main themes key findings results discussion"], [], 1),
                 ("conclusion", "Conclusion", "Conclude what the document is mainly saying without adding operational advice.", ["conclusion final summary implications closing findings"], [], 1),
             ]
+        elif deliverable_type == "Consulting Assessment" and len(extract_scope_items(spec.client_brief)) >= 3:
+            definitions = scope_driven_definitions(spec.client_brief, topic)
         elif deliverable_type == "Curriculum / Teaching Material":
             definitions = [
                 ("overview", "Course Overview", "Orient the reader to the course, its scope, and the source's overall subject.", [f"What is the course about? {topic}", "What purpose and scope does the source establish?"], ["course scope", "source purpose"], 10),
@@ -330,6 +422,8 @@ class DocumentWorkflow:
             target_word_count=target_word_count(spec),
             source_survey=serializable_evidence(survey),
             source_topics=topic_labels,
+            reference_profile=self.reference_profile,
+            scope_requirements=extract_scope_items(spec.client_brief),
             sections=sections,
         )
 
@@ -339,6 +433,10 @@ class DocumentWorkflow:
         on_event: Callable[[str], None] | None = None,
     ) -> DocumentTrace:
         started = datetime.now(timezone.utc)
+        if self.reference_retriever and not self.reference_profile:
+            self._event(on_event, "Analyzing reference report")
+            self.reference_profile = analyze_reference_report(self.reference_retriever)
+            self._event(on_event, "Extracting report blueprint")
         self._event(on_event, "Surveying source")
         survey = self._survey_source(spec)
         self._event(on_event, "Planning document")
@@ -445,7 +543,7 @@ class DocumentWorkflow:
             total_unique_evidence_pages=len({chunk.page for chunk in all_evidence}),
             total_retrieved_evidence_chunks=len(all_evidence),
             total_unique_cited_pages=len({(source, page) for source, page in citation_pairs(cleaned_markdown)}),
-            final_word_count=count_words(cleaned_markdown),
+            final_word_count=count_report_words(cleaned_markdown),
             target_word_count=target_word_count(spec),
         )
 
@@ -476,7 +574,10 @@ class DocumentWorkflow:
         section: DocumentSectionPlan,
         on_event: Callable[[str], None] | None,
     ) -> tuple[list[EvidenceChunk], AgentTrace]:
-        questions = section.questions or [section.objective]
+        # Two distinct questions give breadth while keeping a large client
+        # scope practical in a live demo; the first question retains the full
+        # agentic refinement budget.
+        questions = (section.questions or [section.objective])[:2]
         gathered: dict[str, EvidenceChunk] = {}
         traces: list[AgentTrace] = []
         for index, question in enumerate(questions[:4]):
@@ -524,10 +625,10 @@ def build_long_form_section(
         f"This section addresses {focus.lower()}. For {section.title.lower()}, the source frames the discussion through {first.text.lower()} {first_citation}."
     )
     variants = [
-        "The point is presented as part of the source's treatment of the topic, so it should be read together with the surrounding definitions and results.",
-        "In the context of this section, that evidence clarifies the terminology and progression used by the source rather than introducing an external interpretation.",
-        "The source therefore gives the reader a concrete basis for understanding how this idea is developed and how it relates to the requested deliverable.",
-        "Taken with the other retrieved passages, the passage shows the relationship between the concept, the result, and the way the material is organized.",
+        "This establishes the starting point for the workstream and identifies the evidence that should be tested before a conclusion is adopted.",
+        "The practical implication is a focused diagnostic question: which part of the requested outcome is supported, and which part still requires validation?",
+        "Read alongside the other supplied material, the point helps distinguish an observed condition from a working hypothesis or proposed action.",
+        "This is relevant to the wider strategy because it links the immediate workstream to decisions about sequencing, capability, measurement, and execution.",
     ]
     index = 0
     # Reserve room for the closing synthesis paragraph and heading/context
@@ -541,8 +642,7 @@ def build_long_form_section(
             paragraph = f"- Review the source-backed point that {claim.text.lower()} {citation} {variant} {citation}"
         else:
             paragraph = (
-                f"In {section.title.lower()}, the material also explains that {claim.text.lower()} {citation} {variant} "
-                f"This gives the reader a grounded way to connect the evidence to {section.title.lower()} without extending beyond the uploaded source. {citation}"
+                f"For {section.title.lower()}, the supplied material records that {claim.text.lower()} {citation} {variant} {citation}"
             )
         paragraphs.append(paragraph)
         index += 1
@@ -811,7 +911,7 @@ def resolve_deliverable_type(spec: DocumentSpec) -> str:
     brief = spec.client_brief.lower()
     if any(term in brief for term in ("teach", "lesson", "curriculum", "student", "learning objective", "classroom")):
         return "Curriculum / Teaching Material"
-    if any(term in brief for term in ("risk", "remediation", "roadmap", "90-day", "recommend", "assessment", "action plan")):
+    if any(term in brief for term in ("risk", "remediation", "roadmap", "90-day", "recommend", "assessment", "action plan", "strategy report", "scope of work", "stage 1", "diagnostic")):
         return "Consulting Assessment"
     if any(term in brief for term in ("methodology", "findings", "study", "research", "results", "literature")):
         return "Research Report"
@@ -1069,6 +1169,9 @@ def assemble_markdown(spec: DocumentSpec, plan: DocumentPlan, sections: list[Gen
         "",
         f"**Knowledge Base:** {spec.knowledge_base}",
         f"**Audience:** {spec.audience}",
+        f"**Reference Precedent:** {', '.join(spec.reference_source_names) if spec.reference_source_names else 'None'}",
+        f"**Client Sources:** {', '.join(spec.client_source_names) if spec.client_source_names else 'Client brief and supplied context'}",
+        f"**Company Website:** {spec.company_website or 'None'}",
         "",
         f"**Client Brief:** {spec.client_brief}",
         "",
@@ -1294,12 +1397,15 @@ def document_qc(
     failed_sections = [section.title for section in sections if not section.qc.passed]
     issues = []
     all_evidence = all_evidence or []
-    final_count = count_words(final_markdown)
+    final_count = count_report_words(final_markdown)
     requested_target = target_word_count(spec)
     cited_page_pairs = set(citation_pairs(final_markdown))
     duplication = cross_section_duplication(sections) if spec.source_kind == "uploaded" else []
     contradictions = detect_contradictions(sections) if spec.source_kind == "uploaded" else []
     unsupported_recommendations = unsupported_recommendation_issues(spec, plan, sections)
+    planned_text = " ".join(section.title.lower() for section in sections)
+    missing_scope = [item for item in plan.scope_requirements if re.sub(r"\s+", " ", item.lower()) not in planned_text]
+    leakage = reference_leakage_issues(spec, sections)
     if missing:
         issues.append("One or more planned sections are missing.")
     if failed_sections:
@@ -1322,6 +1428,10 @@ def document_qc(
         issues.append("Contradictions detected between planned sections.")
     if unsupported_recommendations:
         issues.append("Recommendations or operational actions exceed the requested brief.")
+    if missing_scope:
+        issues.append("One or more explicitly requested scope items are not mapped to the report plan.")
+    if leakage:
+        issues.append("Reference-only client names leaked into the generated report body.")
     if not all(section.objective.strip() for section in plan.sections if section.section_id != "evidence"):
         issues.append("One or more planned section objectives are empty.")
     passed = not missing and not failed_sections and citation_validation.valid
@@ -1332,6 +1442,8 @@ def document_qc(
         or "duplication" in issue
         or "Contradictions" in issue
         or "Recommendations or operational" in issue
+        or "scope items" in issue
+        or "Reference-only" in issue
         for issue in issues
     )
     return DocumentQC(
@@ -1349,6 +1461,8 @@ def document_qc(
         cross_section_duplication=duplication,
         contradictions=contradictions,
         unsupported_recommendations=unsupported_recommendations,
+        missing_scope_requirements=missing_scope,
+        reference_leakage=leakage,
     )
 
 
@@ -1396,6 +1510,19 @@ def unsupported_recommendation_issues(
         return []
     action_sections = {"recommendations", "roadmap"}
     return [section.title for section in sections if section.section_id in action_sections and section.content_markdown.strip()]
+
+
+def reference_leakage_issues(spec: DocumentSpec, sections: list[GeneratedSection]) -> list[str]:
+    if not spec.reference_source_names:
+        return []
+    body = " ".join(section.content_markdown for section in sections if section.section_id != "evidence").lower()
+    issues: list[str] = []
+    for name in spec.reference_source_names:
+        stem = re.sub(r"\.pdf$", "", name, flags=re.I)
+        tokens = [token for token in re.findall(r"[a-z]{4,}", stem.lower()) if token not in {"report", "business", "strategy", "approved"}]
+        if len(tokens) >= 2 and all(token in body for token in tokens):
+            issues.append(name)
+    return issues
 
 
 def deliverable_matches_brief(spec: DocumentSpec, plan: DocumentPlan) -> bool:

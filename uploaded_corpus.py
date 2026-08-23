@@ -26,6 +26,10 @@ class UploadedRetriever:
     def __init__(self, chunks: list[EvidenceChunk]):
         self.store = InMemoryVectorStore(chunks)
 
+    @property
+    def chunks(self) -> list[EvidenceChunk]:
+        return self.store.chunks
+
     def search(self, query: str, k: int = 6) -> list[EvidenceChunk]:
         candidates = self.store.search(query, max(20, k * 3))
         return diversify_results(candidates, k=k)

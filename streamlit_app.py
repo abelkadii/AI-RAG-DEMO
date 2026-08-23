@@ -14,9 +14,10 @@ from document_export import docx_bytes, markdown_bytes, pdf_bytes
 from document_models import DocumentSpec, DocumentTrace
 from document_workflow import DEFAULT_BRIEF, DEPTH_PROFILES, DocumentWorkflow, explicit_word_count
 from llm import configured_reasoner
-from models import AgentTrace, IterationTrace
+from models import AgentTrace, EvidenceChunk, IterationTrace
 from retriever import Retriever
-from uploaded_corpus import MAX_UPLOAD_BYTES, MAX_UPLOAD_FILES, UploadedPDF, build_uploaded_retriever, corpus_hash
+from uploaded_corpus import MAX_UPLOAD_BYTES, MAX_UPLOAD_FILES, UploadedPDF, UploadedRetriever, build_uploaded_retriever, corpus_hash
+from website_context import fetch_website_evidence
 
 
 DEFAULT_QUESTION = (
@@ -26,7 +27,7 @@ DEFAULT_QUESTION = (
 )
 
 MAX_QUESTION_LENGTH = 1000
-MAX_BRIEF_LENGTH = 1800
+MAX_BRIEF_LENGTH = 50000
 MAX_TITLE_LENGTH = 140
 MAX_AUDIENCE_LENGTH = 140
 
@@ -63,12 +64,12 @@ def run_agent(question: str) -> AgentTrace:
     return trace
 
 
-def run_document(spec: DocumentSpec, retriever, status_box=None) -> DocumentTrace:
+def run_document(spec: DocumentSpec, retriever, status_box=None, reference_retriever=None) -> DocumentTrace:
     def on_event(message: str) -> None:
         if status_box:
             status_box(message)
 
-    workflow = DocumentWorkflow(retriever, configured_reasoner())
+    workflow = DocumentWorkflow(retriever, configured_reasoner(), max_section_iterations=2, reference_retriever=reference_retriever)
     trace = workflow.run(spec, on_event)
     on_event("Rendering DOCX/PDF")
     # Render once during the run so the demo proves the deliverable is
@@ -315,6 +316,8 @@ def document_studio() -> None:
                 horizontal=True,
             )
             uploaded_files = []
+            reference_files = None
+            website_url = ""
             if source_choice == "Built-in AWS sample":
                 st.markdown(
                     """
@@ -326,20 +329,29 @@ def document_studio() -> None:
                     unsafe_allow_html=True,
                 )
             else:
+                reference_files = st.file_uploader(
+                    "Upload reference report (optional)",
+                    type=["pdf"],
+                    accept_multiple_files=False,
+                    help="Use an approved prior report for structure and style only; it is never treated as client evidence.",
+                )
                 uploaded_files = st.file_uploader(
-                    "Upload source PDFs",
+                    "Upload supporting/client documents (optional)",
                     type=["pdf"],
                     accept_multiple_files=True,
-                    help=f"Upload 1-{MAX_UPLOAD_FILES} PDFs. Each file must be {MAX_UPLOAD_BYTES // (1024 * 1024)} MB or smaller.",
+                    help=f"Upload up to {MAX_UPLOAD_FILES} PDFs. Each file must be {MAX_UPLOAD_BYTES // (1024 * 1024)} MB or smaller.",
                 ) or []
+                website_url = st.text_input("Company website (optional)", placeholder="https://example.com", help="Only a bounded set of same-domain pages is fetched; website context is treated as client evidence.")
+                if reference_files:
+                    st.info(f"Reference precedent: {reference_files.name}")
                 st.markdown(
                     f'<div class="input-help">Upload 1–{MAX_UPLOAD_FILES} PDFs, up to {MAX_UPLOAD_BYTES // (1024 * 1024)} MB each. Files are parsed and indexed only for this demo session.</div>',
                     unsafe_allow_html=True,
                 )
                 if uploaded_files:
-                    st.success(f"{len(uploaded_files)} PDF(s) ready to index: " + ", ".join(file.name for file in uploaded_files))
+                    st.success(f"Client source PDFs: {len(uploaded_files)} ready to index: " + ", ".join(file.name for file in uploaded_files))
                 else:
-                    st.info("Drop PDFs here first, then describe the report you want.")
+                    st.info("A detailed brief can be used as client context even without supporting PDFs.")
     with settings_col:
         with st.container(border=True):
             st.subheader("2. Describe the deliverable")
@@ -364,9 +376,16 @@ def document_studio() -> None:
                 "Client brief / report requirements",
                 value=default_brief,
                 max_chars=MAX_BRIEF_LENGTH,
-                height=190,
-                help="No system prompts, URLs, or external files are accepted here. The report is grounded only in the selected corpus.",
+                height=360,
+                help=f"Long multi-paragraph scopes are supported up to {MAX_BRIEF_LENGTH:,} characters. The report is grounded only in client sources, the brief, and bounded website context.",
             )
+            brief_chars = len(brief)
+            if brief_chars >= MAX_BRIEF_LENGTH:
+                st.error(f"Brief is at the {MAX_BRIEF_LENGTH:,}-character limit. Shorten it before generating so no text is silently truncated.")
+            elif brief_chars >= int(MAX_BRIEF_LENGTH * 0.9):
+                st.warning(f"Brief is near the limit: {brief_chars:,} / {MAX_BRIEF_LENGTH:,} characters.")
+            else:
+                st.caption(f"{brief_chars:,} / {MAX_BRIEF_LENGTH:,} characters")
             c0, c1, c2 = st.columns([1.25, 2, 1])
             with c0:
                 deliverable_type = st.selectbox(
@@ -402,7 +421,7 @@ def document_studio() -> None:
                 low, high = DEPTH_PROFILES[target_depth][1]
                 st.caption(f"Expected length: approximately {low:,}–{high:,} words (references excluded).")
             access_ok = require_access_code()
-            run = st.button("Generate report from selected source", type="primary", use_container_width=True, disabled=not access_ok)
+            run = st.button("Generate report from selected source", type="primary", use_container_width=True, disabled=not access_ok or brief_chars >= MAX_BRIEF_LENGTH)
 
     st.markdown("### Live process")
     feed_placeholder = st.empty()
@@ -416,9 +435,6 @@ def document_studio() -> None:
             st.error("Report title and brief are required.")
             return
         if source_choice == "Upload documents":
-            if not uploaded_files:
-                st.error("Upload at least one PDF.")
-                return
             if len(uploaded_files) > MAX_UPLOAD_FILES:
                 st.error(f"Upload at most {MAX_UPLOAD_FILES} PDFs.")
                 return
@@ -426,15 +442,46 @@ def document_studio() -> None:
             if too_large:
                 st.error(f"These files exceed the demo size limit: {', '.join(too_large)}")
                 return
+            reference_retriever = None
+            reference_names: list[str] = []
+            if reference_files:
+                if reference_files.size > MAX_UPLOAD_BYTES:
+                    st.error(f"Reference report exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)} MB demo limit.")
+                    return
+                reference_payload = ((reference_files.name, reference_files.getvalue()),)
+                reference_uploads = [UploadedPDF(name=reference_files.name, content=reference_files.getvalue())]
+                reference_retriever = cached_uploaded_retriever(corpus_hash(reference_uploads), reference_payload)
+                reference_names = [reference_files.name]
+
             payload = tuple((file.name, file.getvalue()) for file in uploaded_files)
-            uploaded = [UploadedPDF(name=name, content=content) for name, content in payload]
-            key = corpus_hash(uploaded)
-            retriever = cached_uploaded_retriever(key, payload)
-            source_names = ", ".join(name for name, _ in payload)
+            client_chunks: list[EvidenceChunk] = []
+            client_names = [name for name, _ in payload]
+            if payload:
+                uploaded = [UploadedPDF(name=name, content=content) for name, content in payload]
+                client_retriever = cached_uploaded_retriever(corpus_hash(uploaded), payload)
+                client_chunks.extend(client_retriever.chunks)
+            client_chunks.append(EvidenceChunk(
+                chunk_id="client-brief-p001-c00",
+                page=1,
+                section="Client brief",
+                source="Client Brief",
+                text=brief.strip(),
+                score=1.0,
+            ))
+            website_notice = None
+            if website_url.strip():
+                website_chunks, website_notice = fetch_website_evidence(website_url.strip(), max_pages=3)
+                client_chunks.extend(website_chunks)
+            retriever = UploadedRetriever(client_chunks)
+            source_names = ", ".join(client_names) if client_names else "Client brief"
             source_kind = "uploaded"
-            knowledge_base = f"Uploaded documents: {source_names}"
+            knowledge_base = f"Client evidence: {source_names}"
         else:
             retriever = shared_retriever()
+            reference_retriever = None
+            reference_names = []
+            client_names = []
+            website_notice = None
             source_kind = "aws_sample"
             knowledge_base = "AWS Well-Architected Framework"
         spec = DocumentSpec(
@@ -446,12 +493,20 @@ def document_studio() -> None:
             source_kind=source_kind,
             deliverable_type=deliverable_type,
             target_word_count=requested_words,
+            reference_source_names=reference_names,
+            client_source_names=client_names,
+            company_website=website_url.strip() if source_kind == "uploaded" and website_url.strip() else None,
         )
         events = [
             f"Selected source: {knowledge_base}",
+            *(f"Reference precedent: {name}" for name in reference_names),
+            *(f"Client source: {name}" for name in client_names),
+            *( [f"Client website: {website_url.strip()}"] if source_kind == "uploaded" and website_url.strip() else [] ),
             f"Deliverable type: {deliverable_type}",
             "Starting evidence-grounded document workflow",
         ]
+        if website_notice:
+            events.append(website_notice)
         feed_placeholder.markdown(render_terminal(events), unsafe_allow_html=True)
 
         def on_feed(message: str) -> None:
@@ -460,7 +515,7 @@ def document_studio() -> None:
 
         with st.spinner("Generating report — watch the live process feed below."):
             try:
-                trace = run_document(spec, retriever, on_feed)
+                trace = run_document(spec, retriever, on_feed, reference_retriever=reference_retriever)
             except Exception as error:
                 events.append(f"Document generation failed: {error}")
                 feed_placeholder.markdown(render_terminal(events, state="error"), unsafe_allow_html=True)
@@ -493,6 +548,11 @@ def render_document_results(trace: DocumentTrace) -> None:
         ]
     )
     st.caption(f"Sections revised once by QC: {revised}")
+    st.caption(
+        f"Reference precedent: {', '.join(trace.spec.reference_source_names) if trace.spec.reference_source_names else 'None'} | "
+        f"Client sources: {', '.join(trace.spec.client_source_names) if trace.spec.client_source_names else 'Client brief'} | "
+        f"Website: {trace.spec.company_website or 'None'}"
+    )
 
     preview, quality, evidence, downloads = st.tabs(["Report Preview", "Quality Review", "Research & Evidence", "Downloads"])
     with preview:
