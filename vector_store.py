@@ -130,15 +130,31 @@ class PersistentVectorStore:
     def search(self, query: str, k: int = 6) -> list[EvidenceChunk]:
         if self.vectors is None:
             self.load()
-        assert self.vectors is not None
-        query_vector = self.embedder.embed([query])[0]
-        scores = self.vectors @ query_vector
-        query_terms = set(_terms(query))
-        if query_terms:
-            lexical = np.asarray(
-                [len(query_terms & set(_terms(chunk.text))) / len(query_terms) for chunk in self.chunks],
-                dtype=np.float32,
-            )
-            scores = scores + 0.25 * lexical
-        top = np.argsort(scores)[::-1][: min(k, len(self.chunks))]
-        return [self.chunks[int(i)].model_copy(update={"score": float(scores[i])}) for i in top]
+        return _search_loaded(query, k, self.embedder, self.vectors, self.chunks)
+
+
+class InMemoryVectorStore:
+    def __init__(self, chunks: Iterable[EvidenceChunk], embedder: Embedder | None = None):
+        self.embedder = embedder or configured_embedder()
+        self.chunks = list(chunks)
+        if not self.chunks:
+            raise ValueError("Cannot build an in-memory index with no chunks")
+        self.vectors = self.embedder.embed([chunk.text for chunk in self.chunks])
+
+    def search(self, query: str, k: int = 6) -> list[EvidenceChunk]:
+        return _search_loaded(query, k, self.embedder, self.vectors, self.chunks)
+
+
+def _search_loaded(query: str, k: int, embedder: Embedder, vectors: np.ndarray | None, chunks: list[EvidenceChunk]) -> list[EvidenceChunk]:
+    assert vectors is not None
+    query_vector = embedder.embed([query])[0]
+    scores = vectors @ query_vector
+    query_terms = set(_terms(query))
+    if query_terms:
+        lexical = np.asarray(
+            [len(query_terms & set(_terms(chunk.text))) / len(query_terms) for chunk in chunks],
+            dtype=np.float32,
+        )
+        scores = scores + 0.25 * lexical
+    top = np.argsort(scores)[::-1][: min(k, len(chunks))]
+    return [chunks[int(i)].model_copy(update={"score": float(scores[i])}) for i in top]

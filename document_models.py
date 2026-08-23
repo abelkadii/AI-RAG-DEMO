@@ -16,6 +16,15 @@ class DocumentSpec(BaseModel):
     audience: str = "Executive and technical stakeholders"
     target_depth: Literal["Demo", "Detailed"] = "Demo"
     knowledge_base: str = "AWS Well-Architected Framework"
+    source_kind: Literal["aws_sample", "uploaded"] = "aws_sample"
+    deliverable_type: Literal[
+        "Auto",
+        "Summary / Brief",
+        "Consulting Assessment",
+        "Research Report",
+        "Curriculum / Teaching Material",
+        "Custom",
+    ] = "Auto"
 
 
 class DocumentSectionPlan(BaseModel):
@@ -28,6 +37,7 @@ class DocumentSectionPlan(BaseModel):
 class DocumentPlan(BaseModel):
     title: str
     sections: list[DocumentSectionPlan]
+    deliverable_type: str = "Consulting Assessment"
 
 
 class SectionQC(BaseModel):

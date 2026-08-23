@@ -1,11 +1,11 @@
 # AI-RAG-DEMO
 
-This repository demonstrates two connected capabilities over the AWS Well-Architected Framework corpus:
+This repository demonstrates two connected capabilities over a selectable evidence corpus:
 
 1. **Agentic RAG** - iterative evidence retrieval with sufficiency checks, refinement, citations, and full traces.
 2. **Evidence-Grounded Document Production** - a consulting-style report pipeline that plans, researches, drafts, reviews, and exports a structured deliverable.
 
-The AWS corpus is a representative consulting knowledge base. The same workflow architecture can be adapted to other company knowledge bases, templates, methodologies, lesson plans, or report formats.
+The AWS Well-Architected Framework is included as the built-in zero-setup sample knowledge base. Document Studio can also ingest a small set of uploaded PDFs for a session-oriented prospect demo, using the same retrieval, evidence assessment, citation, and report-generation flow.
 
 ## Document Studio Workflow
 
@@ -19,14 +19,16 @@ Source Knowledge + Client Brief
 -> Document-Level Review
 -> Formatted Deliverable
 
-The default Streamlit experience is **Document Studio**, which generates an AWS Well-Architected Architecture Assessment & Remediation Plan. It includes:
+The default Streamlit experience is **Document Studio**, which can generate either an AWS Well-Architected assessment from the built-in sample corpus or a generic evidence-grounded report from uploaded PDFs. It includes:
 
 - editable report title, brief, audience, and target depth;
-- AWS Well-Architected Framework as the source knowledge base;
+- a source selector for the built-in AWS sample or uploaded PDF documents;
 - section-level research traces;
-- cited report sections;
+- source/page cited report sections, such as `[AWS Well-Architected Framework p.303]` or `[Strategy_Report.pdf p.12]`;
 - automated section QC and document QC;
 - downloads for DOCX, Markdown, and JSON trace.
+
+Uploaded PDFs are parsed page-by-page, chunked, indexed in memory, and cached by content hash for Streamlit reruns. Uploaded client documents are not committed to the repository and are not intended to become a persistent document library.
 
 ## Agentic RAG
 
@@ -45,7 +47,8 @@ Every run records search queries, reasons, retrieved page/section metadata, suff
 ## Architecture
 
 - `ingest.py`: downloads/extracts the AWS PDF, chunks it, detects pillar labels, and writes the persistent index.
-- `vector_store.py`: persistent local cosine-search store with local hash embeddings or optional OpenAI-compatible embeddings.
+- `uploaded_corpus.py`: parses bounded PDF uploads into session-oriented searchable evidence chunks.
+- `vector_store.py`: persistent and in-memory cosine-search stores with local hash embeddings or optional OpenAI-compatible embeddings.
 - `retriever.py`: exposes `search(query, k) -> list[EvidenceChunk]`.
 - `agent.py`: runs the explicit search -> retrieve -> assess -> refine -> stop loop.
 - `llm.py`: OpenAI-compatible reasoning path with bounded structured-output retry and an offline deterministic fallback.
@@ -105,7 +108,7 @@ Run:
 pytest -q
 ```
 
-Tests cover the RAG loop, duplicate-query/no-progress safety, citation validation, malformed structured-output retry, zero-evidence behavior, document workflow execution, section evidence association, section QC/revision behavior, DOCX export, and document trace serialization.
+Tests cover the RAG loop, duplicate-query/no-progress safety, source/page citation validation, malformed structured-output retry, zero-evidence behavior, document workflow execution, uploaded PDF chunking, generic uploaded-document planning, section evidence association, section QC/revision behavior, DOCX export, and document trace serialization.
 
 ## Streamlit Deployment
 
@@ -125,4 +128,4 @@ Do not commit `.streamlit/secrets.toml`; it is ignored by git.
 
 ## Demo Notes
 
-This is a prospect-facing demo, not a production multi-tenant product. It is designed to show how source knowledge, retrieval, evidence checks, QC, and formatted deliverables can work together. It does not claim to have produced real 100-200 page client reports.
+This is a prospect-facing demo, not a production multi-tenant product. It is designed to show how source knowledge, retrieval, evidence checks, QC, and formatted deliverables can work together. It does not include persistent document libraries, user accounts, vector-database infrastructure, or multi-tenant storage, and it does not claim to have produced real 100-200 page client reports.

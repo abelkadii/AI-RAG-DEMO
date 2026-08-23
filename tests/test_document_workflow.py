@@ -1,8 +1,9 @@
 from document_export import docx_bytes, markdown_bytes
 from document_models import DocumentSpec, SectionQC
-from document_workflow import DEFAULT_BRIEF, DocumentWorkflow
+from document_workflow import DEFAULT_BRIEF, DocumentWorkflow, resolve_deliverable_type
 from llm import LocalReasoner
 from models import EvidenceChunk
+from uploaded_corpus import clean_uploaded_text, extract_pdf_bytes
 
 
 class DocumentFakeRetriever:
@@ -85,6 +86,91 @@ def test_document_trace_serializes_correctly():
     payload = trace.model_dump_json()
     assert "final_qc" in payload
     assert "research_trace" in payload
+
+
+def test_uploaded_pdf_chunks_use_uploaded_source_name():
+    import pymupdf
+
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "This strategy report describes curriculum risks, recommendations, and implementation steps.")
+    content = doc.tobytes()
+    doc.close()
+
+    chunks = extract_pdf_bytes(content, "Strategy_Report.pdf")
+    assert chunks
+    assert chunks[0].source == "Strategy_Report.pdf"
+    assert chunks[0].page == 1
+
+
+def test_uploaded_mode_uses_generic_sections_without_aws_specific_leakage():
+    spec = DocumentSpec(
+        title="Client Strategy Report",
+        client_brief="Analyze the uploaded strategy document and recommend next steps.",
+        knowledge_base="Uploaded documents: Strategy_Report.pdf",
+        source_kind="uploaded",
+        target_depth="Demo",
+    )
+    trace = make_workflow().run(spec)
+    titles = [section.title for section in trace.plan.sections]
+    assert "Reliability Assessment" not in titles
+    assert "Security Assessment" not in titles
+    assert "Cost Optimization Assessment" not in titles
+    assert "AWS Well-Architected" not in trace.final_markdown
+
+
+def test_auto_summary_brief_uses_concise_summary_structure_without_roadmap():
+    spec = DocumentSpec(
+        title="Presentation Summary",
+        client_brief="what does this talk about, explain briefly",
+        knowledge_base="Uploaded documents: Presentation.pdf",
+        source_kind="uploaded",
+        deliverable_type="Auto",
+        target_depth="Demo",
+    )
+    trace = make_workflow().run(spec)
+    assert trace.plan.deliverable_type == "Summary / Brief"
+    assert [section.section_id for section in trace.plan.sections] == [
+        "overview",
+        "key-points",
+        "brief-explanation",
+        "evidence",
+    ]
+    forbidden = ("Implementation Roadmap", "Prioritized Recommendations", "acceptance criteria", "rollout", "Priority 1")
+    assert not any(term in trace.final_markdown for term in forbidden)
+    assert trace.final_qc.passed
+
+
+def test_auto_classifies_research_and_consulting_briefs_differently():
+    research = DocumentSpec(client_brief="summarize the methodology and findings", source_kind="uploaded")
+    consulting = DocumentSpec(client_brief="identify risks, recommend remediations, give a 90-day roadmap", source_kind="uploaded")
+    assert resolve_deliverable_type(research) == "Research Report"
+    assert resolve_deliverable_type(consulting) == "Consulting Assessment"
+
+
+def test_uploaded_text_cleaning_removes_slide_counters_and_fragments_preserves_arabic():
+    text = clean_uploaded_text(
+        """
+        Presentation Title
+        17 / 17
+        Confidential
+        هذا العرض يشرح أهداف البرنامج ونتائجه المتوقعة.
+        The presentation explains the program goals and expected outcomes.
+        Slide 2 of 9
+        """,
+        "Presentation.pdf",
+    )
+    assert "17 / 17" not in text
+    assert "Slide 2 of 9" not in text
+    assert "Confidential" not in text
+    assert "هذا العرض" in text
+
+
+def test_references_are_built_from_citations_used_in_report():
+    trace = make_workflow().run(make_spec())
+    references = trace.final_markdown.split("## Evidence / References", 1)[1]
+    assert "[AWS-WAF p." in references or "[AWS Well-Architected Framework p." in references
+    assert trace.citation_validation.cited_references
 
 
 class FailsOnceQC:

@@ -23,28 +23,43 @@ class OpenAIReasoner:
         from openai import OpenAI
 
         self.model = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
-        self.max_json_tokens = int(os.getenv("OPENAI_JSON_MAX_TOKENS", "500"))
+        self.max_json_tokens = int(os.getenv("OPENAI_JSON_MAX_TOKENS", "900"))
         self.max_answer_tokens = int(os.getenv("OPENAI_ANSWER_MAX_TOKENS", "900"))
         self.client = OpenAI(
             api_key=os.environ["OPENAI_API_KEY"],
             base_url=os.getenv("OPENAI_BASE_URL") or None,
         )
 
+    def _token_limit_arg(self, token_limit: int) -> dict:
+        if self.model.startswith("gpt-5"):
+            return {"max_completion_tokens": token_limit}
+        return {"max_tokens": token_limit}
+
+    def _sampling_args(self) -> dict:
+        if self.model.startswith("gpt-5"):
+            return {}
+        return {"temperature": 0}
+
     def _json(self, system: str, payload: dict, schema: type):
         last_error: Exception | None = None
-        for attempt in range(2):
+        for attempt in range(3):
             try:
+                token_limit = getattr(self, "max_json_tokens", 900)
+                if self.model.startswith("gpt-5"):
+                    token_limit = max(token_limit, 1200) + (attempt * 600)
                 response = self.client.chat.completions.create(
                     model=self.model,
                     response_format={"type": "json_object"},
-                    temperature=0,
-                    max_tokens=getattr(self, "max_json_tokens", 500),
+                    **self._sampling_args(),
+                    **self._token_limit_arg(token_limit),
                     messages=[
                         {"role": "system", "content": system},
                         {"role": "user", "content": json.dumps(payload)},
                     ],
                 )
                 content = response.choices[0].message.content or ""
+                if not content.strip():
+                    raise ValueError("Model returned empty structured output")
                 return schema.model_validate_json(content)
             except (ValidationError, json.JSONDecodeError, ValueError, TypeError, KeyError, IndexError) as error:
                 last_error = error
@@ -60,45 +75,49 @@ class OpenAIReasoner:
     def decide_search(self, state: AgentState) -> SearchDecision:
         evidence = [_evidence_payload(item, 600) for item in state.gathered_evidence]
         overview = overview_context(state)
-        return self._json(
-            "You plan searches over the AWS Well-Architected Framework. Return JSON with "
-            "search_query and reason. Target the most important information not yet supported. "
-            "Do not repeat or lightly paraphrase prior searches. If overview_context is present, "
-            "ignore vague phrasing as a retrieval target and plan from normalized_information_need. "
-            "Choose a meaningfully different unresolved search strategy, preferring introduction, "
-            "framework definition, purpose, pillars, and framework use evidence. "
-            "When evidence is partial, change strategy to target the explicitly missing information. "
-            "If search_strategy_feedback is present, obey it and produce a meaningfully different query.",
-            {
-                "question": state.original_question,
-                "overview_context": overview,
-                "searches": [s.model_dump() for s in state.searches],
-                "rejected_duplicate_queries": state.rejected_search_queries,
-                "evidence": evidence,
-                "latest_assessment": state.assessments[-1].model_dump() if state.assessments else None,
-                "search_strategy_feedback": state.search_strategy_feedback,
-            },
-            SearchDecision,
-        )
+        try:
+            return self._json(
+                "You plan searches over the supplied evidence corpus. Return JSON with "
+                "search_query and reason. Target the most important information not yet supported. "
+                "Do not repeat or lightly paraphrase prior searches. If overview_context is present, "
+                "ignore vague phrasing as a retrieval target and plan from normalized_information_need. "
+                "Choose a meaningfully different unresolved search strategy. "
+                "When evidence is partial, change strategy to target the explicitly missing information. "
+                "If search_strategy_feedback is present, obey it and produce a meaningfully different query.",
+                {
+                    "question": state.original_question,
+                    "overview_context": overview,
+                    "searches": [s.model_dump() for s in state.searches],
+                    "rejected_duplicate_queries": state.rejected_search_queries,
+                    "evidence": evidence,
+                    "latest_assessment": state.assessments[-1].model_dump() if state.assessments else None,
+                    "search_strategy_feedback": state.search_strategy_feedback,
+                },
+                SearchDecision,
+            )
+        except RuntimeError:
+            return LocalReasoner().decide_search(state)
 
     def assess(self, state: AgentState) -> EvidenceAssessment:
         overview = overview_context(state)
-        return self._json(
-            "Assess whether the supplied AWS evidence fully supports a cited answer to the question. "
-            "Break the original question into material parts and track each part as supported, "
-            "partially_supported, or unsupported. Stop only when all material parts are supported by "
-            "specific supplied evidence, except overview_context questions are broad: sufficient evidence "
-            "can establish what the framework is for and/or what it broadly covers or its pillars. "
-            "Return JSON with sufficient, reason, missing_information, "
-            "suggested_next_search (null if sufficient), supported_information, "
-            "partially_supported_information, and unsupported_information.",
-            {
-                "question": state.original_question,
-                "overview_context": overview,
-                "evidence": [_evidence_payload(e, 1200) for e in state.gathered_evidence],
-            },
-            EvidenceAssessment,
-        )
+        try:
+            return self._json(
+                "Assess whether the supplied evidence fully supports a cited answer to the question. "
+                "Break the original question into material parts and track each part as supported, "
+                "partially_supported, or unsupported. Stop only when all material parts are supported by "
+                "specific supplied evidence. For broad overview questions, sufficient evidence can establish "
+                "what the source is about and/or what it broadly covers. Return JSON with sufficient, reason, "
+                "missing_information, suggested_next_search (null if sufficient), supported_information, "
+                "partially_supported_information, and unsupported_information.",
+                {
+                    "question": state.original_question,
+                    "overview_context": overview,
+                    "evidence": [_evidence_payload(e, 1200) for e in state.gathered_evidence],
+                },
+                EvidenceAssessment,
+            )
+        except RuntimeError:
+            return local_assess_any_corpus(state)
 
     def answer(self, state: AgentState) -> str:
         if not state.gathered_evidence:
@@ -110,8 +129,8 @@ class OpenAIReasoner:
         }
         response = self.client.chat.completions.create(
             model=self.model,
-            temperature=0,
-            max_tokens=getattr(self, "max_answer_tokens", 900),
+            **self._sampling_args(),
+            **self._token_limit_arg(getattr(self, "max_answer_tokens", 900)),
             messages=[
                 {"role": "system", "content": "Answer only from supplied evidence. Support every major claim with a page citation exactly like [AWS-WAF p.42]. If evidence_sufficient is false, explicitly identify the limitation. Never invent facts."},
                 {"role": "user", "content": json.dumps(prompt)},
@@ -414,6 +433,68 @@ class LocalReasoner:
         if not candidates:
             return None
         return max(candidates, key=lambda item: (item[0], item[1]))[2]
+
+
+def local_assess_any_corpus(state: AgentState) -> EvidenceAssessment:
+    if not state.gathered_evidence:
+        return EvidenceAssessment(
+            sufficient=False,
+            reason="No evidence has been retrieved yet.",
+            missing_information=["source evidence"],
+            suggested_next_search=state.original_question,
+            supported_information=[],
+            partially_supported_information=[],
+            unsupported_information=["source evidence"],
+        )
+    question_terms = {
+        term
+        for term in re.findall(r"[\w\u0600-\u06FF]{4,}", state.original_question.lower())
+        if term not in GENERIC_STOP_TERMS
+    }
+    evidence_terms = {
+        term
+        for chunk in state.gathered_evidence
+        for term in re.findall(r"[\w\u0600-\u06FF]{4,}", chunk.text.lower())
+        if term not in GENERIC_STOP_TERMS
+    }
+    overlap = sorted(question_terms & evidence_terms)
+    broad_summary = bool(re.search(r"\b(what.*talk about|explain briefly|summary|summarize|overview|main topic)\b", state.original_question.lower()))
+    enough = broad_summary or bool(overlap) or bool(evidence_terms)
+    supported = ["main topic and source-backed explanation"] if broad_summary else (overlap or ["retrieved source evidence"])
+    missing = [] if enough else ["stronger semantic match to the brief"]
+    return EvidenceAssessment(
+        sufficient=enough,
+        reason="Retrieved evidence is sufficient for the requested brief." if enough else "Retrieved evidence does not yet match the brief.",
+        missing_information=missing,
+        suggested_next_search=None if enough else state.original_question,
+        supported_information=supported,
+        partially_supported_information=[],
+        unsupported_information=[] if enough else missing,
+    )
+
+
+GENERIC_STOP_TERMS = {
+    "what",
+    "does",
+    "this",
+    "talk",
+    "about",
+    "briefly",
+    "explain",
+    "summary",
+    "summarize",
+    "document",
+    "source",
+    "report",
+    "presentation",
+    "uploaded",
+    "with",
+    "from",
+    "that",
+    "into",
+    "your",
+    "their",
+}
 
 
 def configured_reasoner() -> Reasoner:

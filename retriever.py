@@ -14,5 +14,9 @@ class Retriever:
         self.store = PersistentVectorStore(index_dir or os.getenv("INDEX_DIR", "data/index"), embedder)
 
     def search(self, query: str, k: int = 6) -> list[EvidenceChunk]:
-        return self.store.search(query, k)
-
+        results = self.store.search(query, k)
+        return [
+            chunk.model_copy(update={"source": "AWS Well-Architected Framework"})
+            if chunk.source == "AWS-WAF" else chunk
+            for chunk in results
+        ]

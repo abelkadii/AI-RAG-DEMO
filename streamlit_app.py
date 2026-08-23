@@ -16,6 +16,7 @@ from document_workflow import DEFAULT_BRIEF, DocumentWorkflow
 from llm import configured_reasoner
 from models import AgentTrace, IterationTrace
 from retriever import Retriever
+from uploaded_corpus import MAX_UPLOAD_BYTES, MAX_UPLOAD_FILES, UploadedPDF, build_uploaded_retriever, corpus_hash
 
 
 DEFAULT_QUESTION = (
@@ -31,7 +32,7 @@ MAX_AUDIENCE_LENGTH = 140
 
 
 def configure_credentials() -> None:
-    load_dotenv()
+    load_dotenv(override=True)
     for key in (
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
@@ -62,13 +63,19 @@ def run_agent(question: str) -> AgentTrace:
     return trace
 
 
-def run_document(spec: DocumentSpec, status_box=None) -> DocumentTrace:
+def run_document(spec: DocumentSpec, retriever, status_box=None) -> DocumentTrace:
     def on_event(message: str) -> None:
         if status_box:
-            status_box.write(message)
+            status_box(message)
 
-    workflow = DocumentWorkflow(shared_retriever(), configured_reasoner())
+    workflow = DocumentWorkflow(retriever, configured_reasoner())
     return workflow.run(spec, on_event)
+
+
+@st.cache_resource(show_spinner=False)
+def cached_uploaded_retriever(cache_key: str, _files_payload: tuple[tuple[str, bytes], ...]):
+    files = [UploadedPDF(name=name, content=content) for name, content in _files_payload]
+    return build_uploaded_retriever(files)
 
 
 def apply_styles() -> None:
@@ -88,7 +95,7 @@ def apply_styles() -> None:
                 linear-gradient(140deg, #07111c 0%, #0b1420 54%, #060c14 100%);
         }
         .block-container {
-            max-width: 1280px;
+            max-width: 1680px;
             padding-top: 1.2rem;
             padding-bottom: 4rem;
         }
@@ -124,6 +131,47 @@ def apply_styles() -> None:
             padding: 7px 12px;
             font-size: .88rem;
             font-weight: 650;
+        }
+        .input-help {
+            color: var(--muted);
+            font-size: .9rem;
+            line-height: 1.45;
+            margin: -2px 0 12px;
+        }
+        .source-card {
+            border: 1px solid rgba(255,255,255,.14);
+            border-radius: 12px;
+            padding: 14px 15px;
+            background: rgba(255,255,255,.045);
+            margin-top: 10px;
+        }
+        .source-card strong { color: #f8fafc; }
+        .source-card p { color: var(--muted); margin: 5px 0 0; font-size: .9rem; }
+        .terminal-feed {
+            height: 300px;
+            overflow-y: auto;
+            border: 1px solid rgba(93,215,255,.28);
+            border-radius: 12px;
+            padding: 14px 16px;
+            background:
+                linear-gradient(180deg, rgba(2,6,12,.96), rgba(5,12,22,.96));
+            box-shadow: inset 0 0 0 1px rgba(255,255,255,.03), 0 20px 60px rgba(0,0,0,.22);
+            font-family: Consolas, "SFMono-Regular", Menlo, monospace;
+            color: #d9f99d;
+            font-size: .88rem;
+            line-height: 1.5;
+            white-space: pre-wrap;
+        }
+        .terminal-feed .dim { color: #8aa0b8; }
+        .terminal-feed .ok { color: #86efac; }
+        .terminal-feed .err { color: #fca5a5; }
+        .terminal-feed .cursor {
+            display: inline-block;
+            width: 8px;
+            height: 1em;
+            margin-left: 3px;
+            background: #86efac;
+            vertical-align: -2px;
         }
         .metric-row {
             display: grid;
@@ -229,33 +277,105 @@ def require_access_code() -> bool:
     return False
 
 
+def render_terminal(events: list[str], *, state: str = "running") -> str:
+    klass = "ok" if state == "complete" else "err" if state == "error" else "dim"
+    prefix = "✓ complete" if state == "complete" else "✕ failed" if state == "error" else "● running"
+    lines = [f'<span class="{klass}">{escape(prefix)}</span>', ""]
+    lines.extend(f"$ {escape(event)}" for event in events[-80:])
+    if state == "running":
+        lines.append('<span class="cursor"></span>')
+    return f'<div class="terminal-feed">{"<br>".join(lines)}</div>'
+
+
 def document_studio() -> None:
     hero(
-        "AI Document Studio for AWS Architecture Reports",
-        "Turn source knowledge and a client brief into a researched, reviewed, cited consulting deliverable.",
+        "AI Document Studio",
+        "Upload PDFs or use the AWS sample, then turn source knowledge and a client brief into a researched, reviewed, cited consulting deliverable.",
         ["Sources", "Requirements", "Plan", "Research", "Draft", "Review", "Deliver"],
         "Evidence-grounded document production",
     )
-    source_col, settings_col = st.columns([1, 2])
+    source_col, settings_col = st.columns([1.05, 1.95], gap="large")
     with source_col:
         with st.container(border=True):
-            st.subheader("Knowledge Base")
-            st.write("AWS Well-Architected Framework")
-            st.caption("Pre-indexed AWS corpus with page and pillar metadata.")
+            st.subheader("1. Choose source knowledge")
+            st.markdown(
+                '<div class="input-help">Default mode is uploaded PDFs for client-specific demos. Use the AWS sample when you want a zero-setup walkthrough.</div>',
+                unsafe_allow_html=True,
+            )
+            source_choice = st.radio(
+                "Source",
+                ["Upload documents", "Built-in AWS sample"],
+                index=0,
+                horizontal=True,
+            )
+            uploaded_files = []
+            if source_choice == "Built-in AWS sample":
+                st.markdown(
+                    """
+                    <div class="source-card">
+                      <strong>AWS Well-Architected Framework</strong>
+                      <p>Pre-indexed sample corpus with page and pillar metadata. No upload required.</p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            else:
+                uploaded_files = st.file_uploader(
+                    "Upload source PDFs",
+                    type=["pdf"],
+                    accept_multiple_files=True,
+                    help=f"Upload 1-{MAX_UPLOAD_FILES} PDFs. Each file must be {MAX_UPLOAD_BYTES // (1024 * 1024)} MB or smaller.",
+                ) or []
+                st.markdown(
+                    f'<div class="input-help">Upload 1–{MAX_UPLOAD_FILES} PDFs, up to {MAX_UPLOAD_BYTES // (1024 * 1024)} MB each. Files are parsed and indexed only for this demo session.</div>',
+                    unsafe_allow_html=True,
+                )
+                if uploaded_files:
+                    st.success(f"{len(uploaded_files)} PDF(s) ready to index: " + ", ".join(file.name for file in uploaded_files))
+                else:
+                    st.info("Drop PDFs here first, then describe the report you want.")
     with settings_col:
         with st.container(border=True):
+            st.subheader("2. Describe the deliverable")
+            st.markdown(
+                '<div class="input-help">Tell the agent what to produce, who it is for, and what decisions the report should support.</div>',
+                unsafe_allow_html=True,
+            )
+            default_title = (
+                "AWS Well-Architected Architecture Assessment & Remediation Plan"
+                if source_choice == "Built-in AWS sample"
+                else "Concise Source Summary"
+            )
             title = st.text_input(
                 "Report title",
-                value="AWS Well-Architected Architecture Assessment & Remediation Plan",
+                value=default_title,
                 max_chars=MAX_TITLE_LENGTH,
             )
-            brief = st.text_area(
-                "Client Brief / Report Requirements",
-                value=DEFAULT_BRIEF,
-                max_chars=MAX_BRIEF_LENGTH,
-                height=150,
+            default_brief = DEFAULT_BRIEF if source_choice == "Built-in AWS sample" else (
+                "what does this talk about, explain briefly"
             )
-            c1, c2 = st.columns([2, 1])
+            brief = st.text_area(
+                "Client brief / report requirements",
+                value=default_brief,
+                max_chars=MAX_BRIEF_LENGTH,
+                height=190,
+                help="No system prompts, URLs, or external files are accepted here. The report is grounded only in the selected corpus.",
+            )
+            c0, c1, c2 = st.columns([1.25, 2, 1])
+            with c0:
+                deliverable_type = st.selectbox(
+                    "Deliverable type",
+                    [
+                        "Auto",
+                        "Summary / Brief",
+                        "Consulting Assessment",
+                        "Research Report",
+                        "Curriculum / Teaching Material",
+                        "Custom",
+                    ],
+                    index=0,
+                    help="Auto classifies the brief before planning. Pick a type to force the structure.",
+                )
             with c1:
                 audience = st.text_input(
                     "Audience",
@@ -265,26 +385,71 @@ def document_studio() -> None:
             with c2:
                 target_depth = st.selectbox("Target depth", ["Demo", "Detailed"], index=0)
             access_ok = require_access_code()
-            run = st.button("Generate consulting report", type="primary", use_container_width=True, disabled=not access_ok)
+            run = st.button("Generate report from selected source", type="primary", use_container_width=True, disabled=not access_ok)
+
+    st.markdown("### Live process")
+    feed_placeholder = st.empty()
+    feed_placeholder.markdown(
+        render_terminal(["Waiting for input and source selection."], state="complete"),
+        unsafe_allow_html=True,
+    )
 
     if run:
         if not title.strip() or not brief.strip():
             st.error("Report title and brief are required.")
             return
+        if source_choice == "Upload documents":
+            if not uploaded_files:
+                st.error("Upload at least one PDF.")
+                return
+            if len(uploaded_files) > MAX_UPLOAD_FILES:
+                st.error(f"Upload at most {MAX_UPLOAD_FILES} PDFs.")
+                return
+            too_large = [file.name for file in uploaded_files if file.size > MAX_UPLOAD_BYTES]
+            if too_large:
+                st.error(f"These files exceed the demo size limit: {', '.join(too_large)}")
+                return
+            payload = tuple((file.name, file.getvalue()) for file in uploaded_files)
+            uploaded = [UploadedPDF(name=name, content=content) for name, content in payload]
+            key = corpus_hash(uploaded)
+            retriever = cached_uploaded_retriever(key, payload)
+            source_names = ", ".join(name for name, _ in payload)
+            source_kind = "uploaded"
+            knowledge_base = f"Uploaded documents: {source_names}"
+        else:
+            retriever = shared_retriever()
+            source_kind = "aws_sample"
+            knowledge_base = "AWS Well-Architected Framework"
         spec = DocumentSpec(
             title=title.strip(),
             client_brief=brief.strip(),
             audience=audience.strip() or "Stakeholders",
             target_depth=target_depth,
+            knowledge_base=knowledge_base,
+            source_kind=source_kind,
+            deliverable_type=deliverable_type,
         )
-        with st.status("Building report...", expanded=True) as status:
+        events = [
+            f"Selected source: {knowledge_base}",
+            f"Deliverable type: {deliverable_type}",
+            "Starting evidence-grounded document workflow",
+        ]
+        feed_placeholder.markdown(render_terminal(events), unsafe_allow_html=True)
+
+        def on_feed(message: str) -> None:
+            events.append(message)
+            feed_placeholder.markdown(render_terminal(events), unsafe_allow_html=True)
+
+        with st.spinner("Generating report — watch the live process feed below."):
             try:
-                trace = run_document(spec, status)
+                trace = run_document(spec, retriever, on_feed)
             except Exception as error:
-                status.update(label="Generation failed", state="error")
+                events.append(f"Document generation failed: {error}")
+                feed_placeholder.markdown(render_terminal(events, state="error"), unsafe_allow_html=True)
                 st.error(f"Document generation failed: {error}")
                 return
-            status.update(label="Deliverable ready", state="complete")
+            events.append("Deliverable ready")
+            feed_placeholder.markdown(render_terminal(events, state="complete"), unsafe_allow_html=True)
         st.session_state["document_trace"] = trace
 
     trace = st.session_state.get("document_trace")

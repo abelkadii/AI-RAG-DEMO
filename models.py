@@ -72,6 +72,8 @@ class CitationValidation(BaseModel):
     valid: bool = False
     cited_pages: list[int] = Field(default_factory=list)
     retrieved_pages: list[int] = Field(default_factory=list)
+    cited_references: list[str] = Field(default_factory=list)
+    retrieved_references: list[str] = Field(default_factory=list)
     uncited_claims: list[str] = Field(default_factory=list)
 
 

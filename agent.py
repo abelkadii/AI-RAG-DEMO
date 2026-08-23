@@ -38,17 +38,20 @@ class Agent:
 
     @staticmethod
     def validate_citations(answer: str, chunks) -> tuple[str, CitationValidation]:
+        retrieved_pairs = {(chunk.source, chunk.page) for chunk in chunks}
         retrieved_pages = sorted({chunk.page for chunk in chunks})
-        retrieved_page_set = set(retrieved_pages)
-        cited_pages = [int(match.group(1)) for match in re.finditer(r"\[AWS-WAF p\.(\d+)\]", answer)]
+        citation_pattern = re.compile(r"\[([^\[\]\n]+?) p\.(\d+)\]")
+        cited = [(match.group(1), int(match.group(2))) for match in citation_pattern.finditer(answer)]
 
         def keep_valid(match):
-            page = int(match.group(1))
-            return match.group(0) if page in retrieved_page_set else ""
+            source = match.group(1)
+            page = int(match.group(2))
+            return match.group(0) if (source, page) in retrieved_pairs else ""
 
-        cleaned = re.sub(r"\[AWS-WAF p\.(\d+)\]", keep_valid, answer)
+        cleaned = citation_pattern.sub(keep_valid, answer)
         cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
-        valid_cited_pages = sorted({page for page in cited_pages if page in retrieved_page_set})
+        valid_pairs = sorted({pair for pair in cited if pair in retrieved_pairs}, key=lambda pair: (pair[0], pair[1]))
+        valid_cited_pages = sorted({page for _, page in valid_pairs})
         uncited_claims = []
         substantive_lines = []
         for line in cleaned.splitlines():
@@ -63,12 +66,14 @@ class Agent:
             if Agent._is_status_statement(stripped):
                 continue
             substantive_lines.append(stripped)
-            if re.search(r"[A-Za-z]{4,}", stripped) and not re.search(r"\[AWS-WAF p\.\d+\]", stripped):
+            if re.search(r"[A-Za-z]{4,}", stripped) and not citation_pattern.search(stripped):
                 uncited_claims.append(stripped)
         validation = CitationValidation(
             valid=not uncited_claims and (bool(valid_cited_pages) or not substantive_lines),
             cited_pages=valid_cited_pages,
             retrieved_pages=retrieved_pages,
+            cited_references=[f"{source} p.{page}" for source, page in valid_pairs],
+            retrieved_references=[f"{source} p.{page}" for source, page in sorted(retrieved_pairs, key=lambda pair: (pair[0], pair[1]))],
             uncited_claims=uncited_claims,
         )
         return cleaned, validation
@@ -198,8 +203,8 @@ class Agent:
         trace.completed_at = completed.isoformat()
         trace.duration_ms = int((completed - started).total_seconds() * 1000)
         trace.citations = sorted(
-            set(re.findall(r"\[AWS-WAF p\.\d+\]", state.final_answer or "")),
-            key=lambda citation: int(re.search(r"\d+", citation).group()),
+            set(re.findall(r"\[[^\[\]\n]+? p\.\d+\]", state.final_answer or "")),
+            key=lambda citation: (re.sub(r" p\.\d+\]$", "", citation), int(re.search(r"p\.(\d+)", citation).group(1))),
         )
         return trace
 
@@ -209,6 +214,10 @@ class Agent:
         trace.citation_validation = CitationValidation(
             valid=True,
             retrieved_pages=sorted({chunk.page for chunk in state.gathered_evidence}),
+            retrieved_references=[
+                f"{source} p.{page}"
+                for source, page in sorted({(chunk.source, chunk.page) for chunk in state.gathered_evidence})
+            ],
         )
         self._finish_trace(started, state, trace)
         return state, trace

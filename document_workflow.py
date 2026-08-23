@@ -68,6 +68,8 @@ class DocumentWorkflow:
         self.qc_runner = qc_runner or DeterministicSectionQC()
 
     def plan(self, spec: DocumentSpec) -> DocumentPlan:
+        if spec.source_kind == "uploaded":
+            return self._uploaded_plan(spec)
         sections = [
             ("executive-summary", "Executive Summary", "Summarize the overall assessment, key risks, and remediation themes.", "AWS Well-Architected reliability security cost optimization architecture assessment summary risks remediation"),
             ("scope-objectives", "Assessment Scope and Objectives", "Define the assessment scope, objectives, and evidence-grounding approach.", "AWS Well-Architected framework overview purpose evaluate architectures best practices"),
@@ -84,6 +86,7 @@ class DocumentWorkflow:
             selected.append(sections[-1])
         return DocumentPlan(
             title=spec.title.strip()[:140] or "AWS Well-Architected Architecture Assessment",
+            deliverable_type="Consulting Assessment",
             sections=[
                 DocumentSectionPlan(
                     section_id=section_id,
@@ -92,6 +95,58 @@ class DocumentWorkflow:
                     research_question=question,
                 )
                 for section_id, title, objective, question in selected[:8]
+            ],
+        )
+
+    def _uploaded_plan(self, spec: DocumentSpec) -> DocumentPlan:
+        topic = spec.client_brief[:500]
+        deliverable_type = resolve_deliverable_type(spec)
+        if deliverable_type == "Summary / Brief":
+            sections = [
+                ("overview", "What This Document Covers", "Briefly explain the subject of the uploaded document.", f"main topic purpose subject overview {topic}"),
+                ("key-points", "Key Points", "Summarize the main points without adding recommendations.", f"main points themes summary {topic}"),
+                ("brief-explanation", "Brief Explanation", "Explain the document in plain language.", f"plain language explanation summary {topic}"),
+                ("evidence", "Evidence / References", "List the source pages cited by the brief.", f"references evidence sources {topic}"),
+            ]
+        elif deliverable_type == "Research Report":
+            sections = [
+                ("executive-summary", "Executive Summary", "Summarize the research topic, methodology, and findings.", f"research summary methodology findings {topic}"),
+                ("methodology", "Methodology", "Describe the methodology represented in the source evidence.", f"methodology approach data methods {topic}"),
+                ("findings", "Findings", "Synthesize the evidence-backed findings.", f"findings results evidence {topic}"),
+                ("interpretation", "Interpretation", "Explain what the findings mean without adding unsupported advice.", f"interpretation implications meaning {topic}"),
+                ("evidence", "Evidence / References", "List the source pages cited by the report.", f"references evidence sources {topic}"),
+            ]
+        elif deliverable_type == "Curriculum / Teaching Material":
+            sections = [
+                ("overview", "Learning Overview", "Explain what the material teaches.", f"learning overview topic concepts {topic}"),
+                ("concepts", "Core Concepts", "Summarize the core concepts from the source.", f"core concepts definitions examples {topic}"),
+                ("teaching-notes", "Teaching Notes", "Turn source-backed concepts into concise teaching notes.", f"teaching notes explanation learners {topic}"),
+                ("evidence", "Evidence / References", "List the source pages cited by the material.", f"references evidence sources {topic}"),
+            ]
+        elif deliverable_type == "Consulting Assessment":
+            sections = [
+                ("executive-summary", "Executive Summary", "Summarize the requested assessment, findings, and requested recommendations.", f"executive summary key findings risks recommendations {topic}"),
+                ("scope-objectives", "Scope and Objectives", "Define the requested scope, audience, and objectives.", f"scope objectives audience requirements {topic}"),
+                ("findings", "Key Findings", "Identify the most important evidence-backed findings.", f"key findings evidence analysis {topic}"),
+                ("recommendations", "Prioritized Recommendations", "Recommend next steps only where requested and evidence-supported.", f"prioritized recommendations next steps {topic}"),
+                ("roadmap", "Implementation Roadmap", "Sequence actions only where the brief requests a roadmap.", f"implementation roadmap phases actions {topic}"),
+                ("evidence", "Evidence / References", "List the source pages cited by the report.", f"references evidence sources {topic}"),
+            ]
+            if spec.target_depth == "Detailed":
+                sections.insert(3, ("analysis", "Analysis", "Explain why the findings matter and how they relate to the brief.", f"analysis implications risks opportunities {topic}"))
+        else:
+            sections = [
+                ("overview", "Overview", "Respond directly to the requested custom deliverable.", f"overview requested deliverable {topic}"),
+                ("key-points", "Key Points", "Extract the most relevant source-backed points.", f"key points evidence {topic}"),
+                ("response", "Requested Output", "Produce the requested output without adding unrequested structure.", f"requested output {topic}"),
+                ("evidence", "Evidence / References", "List the source pages cited by the output.", f"references evidence sources {topic}"),
+            ]
+        return DocumentPlan(
+            title=spec.title.strip()[:140] or "Evidence-Grounded Document Report",
+            deliverable_type=deliverable_type,
+            sections=[
+                DocumentSectionPlan(section_id=section_id, title=title, objective=objective, research_question=question)
+                for section_id, title, objective, question in sections[:8]
             ],
         )
 
@@ -124,13 +179,15 @@ class DocumentWorkflow:
 
             self._event(on_event, f"Running QC for {section_plan.title}")
             qc = self.qc_runner.check(section_plan, content, section_evidence)
+            qc = merge_qc(qc, deterministic_content_checks(spec, plan, section_plan, content, section_evidence))
             revised = False
             revision_count = 0
             if not qc.passed:
                 revised = True
                 revision_count = 1
-                content = revise_section(content, qc, section_evidence)
+                content = revise_section(content, qc, section_evidence, spec, plan)
                 qc = self.qc_runner.check(section_plan, content, section_evidence)
+                qc = merge_qc(qc, deterministic_content_checks(spec, plan, section_plan, content, section_evidence))
 
             generated = GeneratedSection(
                 section_id=section_plan.section_id,
@@ -151,7 +208,7 @@ class DocumentWorkflow:
         final_markdown = assemble_markdown(spec, plan, generated_sections)
         all_evidence = list(evidence_by_id.values())
         cleaned_markdown, citation_validation = Agent.validate_citations(final_markdown, all_evidence)
-        final_qc = document_qc(plan, generated_sections, citation_validation)
+        final_qc = document_qc(spec, plan, generated_sections, citation_validation)
         completed = datetime.now(timezone.utc)
         return DocumentTrace(
             spec=spec,
@@ -183,6 +240,8 @@ class EvidenceGroundedSectionWriter:
         prior_summaries: list[str],
     ) -> str:
         pages = cite_page(evidence)
+        if spec.source_kind == "uploaded":
+            return self._write_uploaded(spec, section, evidence, prior_summaries, pages)
         if section.section_id == "executive-summary":
             return (
                 "The assessment focuses on reliability, security, and cost optimization for a customer-facing AWS workload. "
@@ -250,9 +309,104 @@ class EvidenceGroundedSectionWriter:
         lines.extend(f"- [AWS-WAF p.{page}]" for page in references[:20])
         return "\n".join(lines)
 
+    def _write_uploaded(
+        self,
+        spec: DocumentSpec,
+        section: DocumentSectionPlan,
+        evidence: list[EvidenceChunk],
+        prior_summaries: list[str],
+        citation: str,
+    ) -> str:
+        if section.section_id == "evidence":
+            return "References are generated deterministically from citations used in the report."
+        synthesis = synthesize_evidence(evidence)
+        if not synthesis:
+            return f"This section needs human review because no source evidence was retrieved for the objective. {citation}".strip()
+        brief_focus = brief_focus_sentence(spec.client_brief)
+        first, second = synthesis[0], synthesis[min(1, len(synthesis) - 1)]
+        deliverable_type = resolve_deliverable_type(spec)
+        if deliverable_type == "Summary / Brief":
+            if section.section_id == "overview":
+                return f"The uploaded document appears to discuss {first} {citation}"
+            if section.section_id == "key-points":
+                points = synthesis[:3]
+                return "\n".join(f"- Point {index}: {point} {citation}" for index, point in enumerate(points, start=1))
+            if section.section_id == "brief-explanation":
+                return (
+                    f"In brief, the source presents {first.lower()} {citation}\n\n"
+                    f"It also points to {second.lower()} {citation}\n\n"
+                    f"This explanation is limited to the uploaded evidence and the user's request: {brief_focus}. {citation}"
+                )
+        if deliverable_type == "Research Report":
+            if section.section_id == "executive-summary":
+                return f"This research report summarizes the uploaded evidence around {first.lower()} {citation}"
+            if section.section_id == "methodology":
+                return f"The methodology or approach described in the source centers on {first.lower()} {citation}"
+            if section.section_id == "findings":
+                return f"The main evidence-backed findings are {first.lower()} and {second.lower()} {citation}"
+            if section.section_id == "interpretation":
+                return f"Taken together, the evidence suggests that {first.lower()} {citation}"
+        if deliverable_type == "Curriculum / Teaching Material":
+            if section.section_id == "overview":
+                return f"This teaching material covers {first.lower()} {citation}"
+            if section.section_id == "concepts":
+                return "\n".join(f"- Concept {index}: {point} {citation}" for index, point in enumerate(synthesis[:3], start=1))
+            if section.section_id == "teaching-notes":
+                return f"Teaching notes should explain {first.lower()} and connect it to {second.lower()} {citation}"
+        if section.section_id == "executive-summary":
+            return (
+                f"This assessment responds to the requested brief for {spec.audience}. "
+                f"The source evidence emphasizes {first.lower()} {citation}\n\n"
+                f"- The requested focus is: {brief_focus}. {citation}\n"
+                f"- Findings and recommendations are limited to retrieved source evidence. {citation}"
+            )
+        if section.section_id == "scope-objectives":
+            return (
+                f"The scope is defined by the uploaded documents and the client brief. {citation}\n\n"
+                f"The objective is to produce an evidence-grounded deliverable for {spec.audience} that matches the requested output type: {deliverable_type}. {citation}"
+            )
+        if section.section_id == "findings":
+            return (
+                f"Key finding 1: {first} {citation}\n\n"
+                f"Key finding 2: {second} {citation}\n\n"
+                f"These findings should be interpreted against the uploaded source context rather than generalized beyond it. {citation}"
+            )
+        if section.section_id == "analysis":
+            return (
+                f"The evidence suggests the key issue is how the requested objective connects to the documented source material. {citation}\n\n"
+                f"In practical terms, {first} {citation}\n\n"
+                f"This creates an analysis basis for recommendations without adding unsupported external claims. {citation}"
+            )
+        if section.section_id == "recommendations":
+            if not requests_actions(spec.client_brief):
+                return f"The brief does not request recommendations, so this section limits itself to the evidence-backed point that {first.lower()} {citation}"
+            return (
+                f"Priority 1: address the highest-impact item described in the uploaded material: {first} {citation}\n\n"
+                f"Priority 2: use the supporting source evidence to define practical next steps: {second} {citation}\n\n"
+                f"Priority 3: validate the recommendations with the document owner before operational rollout. {citation}"
+            )
+        if section.section_id == "roadmap":
+            if not requests_roadmap(spec.client_brief):
+                return f"The brief does not request an implementation roadmap; the evidence-backed summary is that {first.lower()} {citation}"
+            return (
+                f"This roadmap sequences the source-backed work into practical phases. {citation}\n\n"
+                f"Near term: confirm the source-backed findings and assign ownership. {citation}\n\n"
+                f"Next phase: convert the findings into specific work items, acceptance criteria, and review checkpoints. {citation}\n\n"
+                f"Later phase: review outcomes against the original brief and update the document set as source knowledge evolves. {citation}"
+            )
+        if section.section_id in {"overview", "key-points", "response"}:
+            return f"{first} {citation}"
+        return f"{section.title}: {first} {citation}"
+
 
 class DeterministicSectionQC:
     def check(self, section: DocumentSectionPlan, content: str, evidence: list[EvidenceChunk]) -> SectionQC:
+        if section.section_id == "evidence":
+            return SectionQC(
+                passed=True,
+                requirements_covered=["reference"],
+                citation_valid=True,
+            )
         _, validation = Agent.validate_citations(content, evidence)
         missing = []
         lower = content.lower()
@@ -282,15 +436,174 @@ def section_requirements(section: DocumentSectionPlan) -> list[str]:
         "security": ["identity", "data"],
         "cost": ["resource", "cost"],
         "recommendations": ["priority"],
-        "roadmap": ["days"],
+        "roadmap": ["roadmap"],
         "scope-objectives": ["objective"],
         "executive-summary": ["assessment"],
-        "evidence": ["aws-waf"],
+        "evidence": ["reference"],
+        "findings": ["finding"],
+        "analysis": ["analysis"],
+        "overview": [],
+        "key-points": ["point"],
+        "brief-explanation": [],
+        "methodology": ["methodology"],
+        "interpretation": ["evidence"],
+        "concepts": ["concept"],
+        "teaching-notes": ["teaching"],
+        "response": ["requested"],
     }
     return requirements.get(section.section_id, [section.title.lower().split()[0]])
 
 
-def revise_section(content: str, qc: SectionQC, evidence: list[EvidenceChunk]) -> str:
+def resolve_deliverable_type(spec: DocumentSpec) -> str:
+    if spec.deliverable_type != "Auto":
+        return spec.deliverable_type
+    brief = spec.client_brief.lower()
+    if any(term in brief for term in ("teach", "lesson", "curriculum", "student", "learning objective", "classroom")):
+        return "Curriculum / Teaching Material"
+    if any(term in brief for term in ("risk", "remediation", "roadmap", "90-day", "recommend", "assessment", "action plan")):
+        return "Consulting Assessment"
+    if any(term in brief for term in ("methodology", "findings", "study", "research", "results", "literature")):
+        return "Research Report"
+    if any(term in brief for term in ("what does this talk about", "explain briefly", "briefly", "short summary", "summarize", "summary")):
+        return "Summary / Brief"
+    return "Custom"
+
+
+def requests_actions(brief: str) -> bool:
+    lower = brief.lower()
+    return any(term in lower for term in ("recommend", "next step", "action", "remediation", "roadmap", "implement", "plan"))
+
+
+def requests_roadmap(brief: str) -> bool:
+    lower = brief.lower()
+    return any(term in lower for term in ("roadmap", "90-day", "timeline", "implementation plan", "phases"))
+
+
+def brief_focus_sentence(brief: str) -> str:
+    cleaned = re.sub(r"\s+", " ", brief).strip()
+    return cleaned[:220].rstrip(".") or "the requested deliverable"
+
+
+def merge_qc(primary: SectionQC, extra: SectionQC) -> SectionQC:
+    requirements = sorted(set(primary.requirements_covered + extra.requirements_covered))
+    missing = sorted(set(primary.missing_requirements + extra.missing_requirements))
+    unsupported = primary.unsupported_claims + [item for item in extra.unsupported_claims if item not in primary.unsupported_claims]
+    issues = primary.issues + [issue for issue in extra.issues if issue not in primary.issues]
+    passed = primary.passed and extra.passed
+    return SectionQC(
+        passed=passed,
+        requirements_covered=requirements,
+        missing_requirements=missing,
+        unsupported_claims=unsupported,
+        citation_valid=primary.citation_valid and extra.citation_valid,
+        issues=issues,
+        revision_instructions="; ".join(filter(None, [primary.revision_instructions, extra.revision_instructions])) or None,
+    )
+
+
+def deterministic_content_checks(
+    spec: DocumentSpec,
+    plan: DocumentPlan,
+    section: DocumentSectionPlan,
+    content: str,
+    evidence: list[EvidenceChunk],
+) -> SectionQC:
+    if section.section_id == "evidence":
+        return SectionQC(
+            passed=True,
+            requirements_covered=["references-generated"],
+            citation_valid=True,
+        )
+    issues: list[str] = []
+    missing: list[str] = []
+    unsupported: list[str] = []
+    lower = content.lower()
+    deliverable_type = plan.deliverable_type
+    forbidden_action_terms = [
+        "recommend",
+        "roadmap",
+        "ownership",
+        "rollout",
+        "acceptance criteria",
+        "priority 1",
+        "priority 2",
+        "near term",
+        "next phase",
+        "implementation",
+        "remediation",
+    ]
+    if deliverable_type == "Summary / Brief" and any(term in lower for term in forbidden_action_terms):
+        issues.append("Summary/brief output contains unrequested recommendations, roadmap, or operational advice.")
+        unsupported.append("Unrequested consulting/action structure")
+    if not requests_actions(spec.client_brief) and section.section_id in {"recommendations", "roadmap"}:
+        issues.append("Recommendations or roadmap section appears even though the brief did not request actions.")
+    if has_raw_artifacts(content):
+        issues.append("Content contains obvious raw header/footer/page-number artifacts.")
+    incomplete = incomplete_sentences(content)
+    if incomplete:
+        issues.append("One or more sentences appear incomplete.")
+        unsupported.extend(incomplete)
+    if evidence and not semantically_supported(content, evidence):
+        issues.append("The cited evidence may not semantically support the section claim.")
+        unsupported.append("Low semantic overlap with retrieved evidence")
+    if deliverable_type == "Summary / Brief" and section.section_id not in {"overview", "key-points", "brief-explanation", "evidence"}:
+        missing.append("summary structure")
+        issues.append("Plan section does not match a concise summary deliverable.")
+    passed = not issues and not missing
+    return SectionQC(
+        passed=passed,
+        requirements_covered=["deliverable-match", "artifact-cleanliness", "semantic-support"] if passed else [],
+        missing_requirements=missing,
+        unsupported_claims=unsupported,
+        citation_valid=True,
+        issues=issues,
+        revision_instructions="Remove unrequested structure, raw artifacts, incomplete sentences, or unsupported operational advice." if issues else None,
+    )
+
+
+def has_raw_artifacts(text: str) -> bool:
+    return bool(re.search(r"(^|\s)\d+\s*/\s*\d+(\s|$)", text) or re.search(r"\b(page|slide)\s+\d+\s+of\s+\d+\b", text, re.I))
+
+
+def incomplete_sentences(text: str) -> list[str]:
+    suspects = []
+    for raw_line in text.splitlines():
+        if re.search(r"\[[^\]]+ p\.\d+\]\s*$", raw_line.strip()):
+            continue
+        line = re.sub(r"\[[^\]]+ p\.\d+\]", "", raw_line).strip(" -*\t")
+        if not line or line.startswith("#") or len(line) < 45:
+            continue
+        if line.endswith((".", "!", "?", ":", "؛", "۔")):
+            continue
+        if line.count(" ") >= 8:
+            suspects.append(line)
+    return suspects[:3]
+
+
+def semantically_supported(content: str, evidence: list[EvidenceChunk]) -> bool:
+    claim_terms = {
+        term
+        for term in re.findall(r"[\w\u0600-\u06FF]{4,}", re.sub(r"\[[^\]]+ p\.\d+\]", "", content).lower())
+        if term not in STOP_TERMS
+    }
+    evidence_terms = {
+        term
+        for chunk in evidence
+        for term in re.findall(r"[\w\u0600-\u06FF]{4,}", chunk.text.lower())
+        if term not in STOP_TERMS
+    }
+    if not claim_terms:
+        return True
+    return len(claim_terms & evidence_terms) >= max(2, min(5, len(claim_terms) // 8))
+
+
+def revise_section(content: str, qc: SectionQC, evidence: list[EvidenceChunk], spec: DocumentSpec | None = None, plan: DocumentPlan | None = None) -> str:
+    if plan and plan.deliverable_type == "Summary / Brief":
+        citation = cite_page(evidence)
+        summary = synthesize_evidence(evidence, limit=2)
+        if not summary:
+            return content
+        return "\n\n".join(f"{point} {citation}" for point in summary)
     citation = cite_page(evidence)
     additions = []
     for requirement in qc.missing_requirements:
@@ -323,11 +636,140 @@ def assemble_markdown(spec: DocumentSpec, plan: DocumentPlan, sections: list[Gen
         "",
     ]
     for section in sections:
+        if section.section_id == "evidence":
+            continue
         lines.extend([f"## {section.title}", "", section.content_markdown.strip(), ""])
+    references = references_from_markdown("\n".join(lines))
+    if references:
+        lines.extend(["## Evidence / References", ""])
+        lines.extend(f"- {reference}" for reference in references)
+        lines.append("")
     return "\n".join(lines).strip() + "\n"
 
 
-def document_qc(plan: DocumentPlan, sections: list[GeneratedSection], citation_validation: CitationValidation) -> DocumentQC:
+def references_from_markdown(markdown: str) -> list[str]:
+    matches = re.findall(r"\[([^\[\]\n]+? p\.\d+)\]", markdown)
+    return sorted({f"[{match}]" for match in matches}, key=lambda item: (item.rsplit(" p.", 1)[0], int(item.rsplit(" p.", 1)[1].rstrip("]"))))
+
+
+STOP_TERMS = {
+    "this",
+    "that",
+    "with",
+    "from",
+    "into",
+    "source",
+    "evidence",
+    "uploaded",
+    "document",
+    "documents",
+    "report",
+    "section",
+    "brief",
+    "requested",
+    "material",
+    "should",
+    "would",
+    "about",
+    "also",
+    "than",
+    "they",
+    "their",
+    "there",
+    "where",
+    "which",
+    "what",
+}
+
+
+def best_snippets(evidence: list[EvidenceChunk], limit: int = 3) -> list[str]:
+    snippets = []
+    for chunk in sorted(evidence, key=lambda item: item.score, reverse=True):
+        sentences = re.split(r"(?<=[.!?])\s+", chunk.text)
+        for sentence in sentences:
+            cleaned = re.sub(r"\s+", " ", sentence).strip()
+            if 60 <= len(cleaned) <= 260:
+                snippets.append(cleaned.rstrip("."))
+                break
+        if len(snippets) >= limit:
+            break
+    if snippets:
+        return snippets
+    return [chunk.text[:220].strip().rstrip(".") for chunk in evidence[:limit] if chunk.text.strip()]
+
+
+def synthesize_evidence(evidence: list[EvidenceChunk], limit: int = 3) -> list[str]:
+    candidates = []
+    seen = set()
+    for chunk in sorted(evidence, key=lambda item: item.score, reverse=True):
+        for sentence in re.split(r"(?<=[.!?؟])\s+", chunk.text):
+            cleaned = normalize_claim_text(sentence)
+            if not useful_evidence_sentence(cleaned):
+                continue
+            key = re.sub(r"\W+", " ", cleaned.lower())[:90]
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(cleaned)
+            break
+        if len(candidates) >= limit:
+            break
+    if not candidates:
+        return []
+    return [compress_claim(candidate) for candidate in candidates[:limit]]
+
+
+def normalize_claim_text(text: str) -> str:
+    text = re.sub(r"\[[^\]]+ p\.\d+\]", "", text)
+    text = re.sub(r"\b\d+\s*/\s*\d+\b", " ", text)
+    text = re.sub(r"\b(page|slide)\s+\d+\s+of\s+\d+\b", " ", text, flags=re.I)
+    text = re.sub(r"\s+", " ", text).strip(" -–—•\t\r\n")
+    return text
+
+
+def useful_evidence_sentence(text: str) -> bool:
+    if len(text) < 35 or len(text) > 320:
+        return False
+    if has_raw_artifacts(text):
+        return False
+    if looks_garbled(text):
+        return False
+    words = re.findall(r"[\w\u0600-\u06FF]+", text)
+    if len(words) < 6:
+        return False
+    short_ratio = sum(1 for word in words if len(word) <= 2) / max(1, len(words))
+    return short_ratio < 0.45
+
+
+def looks_garbled(text: str) -> bool:
+    if "\ufffd" in text:
+        return True
+    visible = [char for char in text if not char.isspace()]
+    if not visible:
+        return True
+    punctuation_ratio = sum(1 for char in visible if not (char.isalnum() or "\u0600" <= char <= "\u06FF")) / len(visible)
+    return punctuation_ratio > 0.38
+
+
+def compress_claim(text: str) -> str:
+    text = normalize_claim_text(text).rstrip(".")
+    prefixes = [
+        "The document says that ",
+        "The source says that ",
+        "This slide says that ",
+        "It says that ",
+    ]
+    lowered = text.lower()
+    for prefix in prefixes:
+        if lowered.startswith(prefix.lower()):
+            text = text[len(prefix) :]
+            break
+    if len(text) > 210:
+        text = text[:210].rsplit(" ", 1)[0]
+    return text[0].upper() + text[1:] if text else text
+
+
+def document_qc(spec: DocumentSpec, plan: DocumentPlan, sections: list[GeneratedSection], citation_validation: CitationValidation) -> DocumentQC:
     present = [section.title for section in sections]
     expected = [section.title for section in plan.sections]
     missing = [title for title in expected if title not in present]
@@ -339,7 +781,14 @@ def document_qc(plan: DocumentPlan, sections: list[GeneratedSection], citation_v
         issues.append(f"Sections needing review: {', '.join(failed_sections)}.")
     if not citation_validation.valid:
         issues.append("Document citation validation found unsupported or uncited claims.")
+    if not deliverable_matches_brief(spec, plan):
+        issues.append("The generated plan does not match the requested deliverable type.")
+    if plan.deliverable_type == "Summary / Brief":
+        titles = " ".join(section.title.lower() for section in sections)
+        if any(term in titles for term in ("recommendation", "roadmap", "implementation")):
+            issues.append("Summary/brief output includes unrequested consulting sections.")
     passed = not missing and not failed_sections and citation_validation.valid
+    passed = passed and not any("does not match" in issue or "unrequested consulting" in issue for issue in issues)
     return DocumentQC(
         passed=passed,
         sections_present=present,
@@ -349,6 +798,10 @@ def document_qc(plan: DocumentPlan, sections: list[GeneratedSection], citation_v
         recommendations_align_with_findings=True,
         summary="Document review passed." if passed else "Document review found issues to inspect.",
     )
+
+
+def deliverable_matches_brief(spec: DocumentSpec, plan: DocumentPlan) -> bool:
+    return plan.deliverable_type == resolve_deliverable_type(spec)
 
 
 def _pages_from_text(text: str) -> set[int]:

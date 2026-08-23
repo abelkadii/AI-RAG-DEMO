@@ -94,6 +94,17 @@ def test_citation_validation_removes_invalid_citations_and_flags_uncited_claims(
     assert validation.uncited_claims == ["Use backups."]
 
 
+def test_citation_validation_requires_matching_source_and_page():
+    answer = "Finding\nUse the strategy. [Other.pdf p.10]"
+    cleaned, validation = Agent.validate_citations(
+        answer,
+        [EvidenceChunk(chunk_id="c1", page=10, source="Strategy.pdf", text="strategy evidence")],
+    )
+    assert "[Other.pdf p.10]" not in cleaned
+    assert validation.valid is False
+    assert validation.retrieved_references == ["Strategy.pdf p.10"]
+
+
 def test_duplicate_query_is_replanned_without_duplicate_retrieval():
     reasoner = DuplicateThenReformulatedReasoner()
     retriever = RecordingRetriever()
@@ -177,9 +188,31 @@ def test_empty_question_fails_cleanly():
 def test_structured_model_output_retries_after_malformed_json():
     reasoner = OpenAIReasoner.__new__(OpenAIReasoner)
     reasoner.model = "fake"
+    reasoner.max_json_tokens = 500
     reasoner.client = FakeClient(["not json", '{"search_query":"AWS reliability","reason":"Need evidence."}'])
     result = reasoner._json("system", {"question": "q"}, SearchDecision)
     assert result.search_query == "AWS reliability"
+
+
+def test_openai_assessment_falls_back_after_empty_structured_output():
+    reasoner = OpenAIReasoner.__new__(OpenAIReasoner)
+    reasoner.model = "gpt-5.6-luna"
+    reasoner.max_json_tokens = 500
+    reasoner.client = FakeClient(["", "", ""])
+    state = AgentState(
+        original_question="what does this talk about, explain briefly",
+        gathered_evidence=[
+            EvidenceChunk(
+                chunk_id="doc-p001-c00",
+                page=1,
+                source="final_report.pdf",
+                text="The presentation explains the program goals, background, and expected outcomes for stakeholders.",
+            )
+        ],
+    )
+    assessment = reasoner.assess(state)
+    assert assessment.sufficient is True
+    assert assessment.supported_information == ["main topic and source-backed explanation"]
 
 
 def test_evidence_assessment_normalizes_model_returned_objects():
