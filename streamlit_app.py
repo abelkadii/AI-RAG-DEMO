@@ -64,6 +64,32 @@ def run_agent(question: str) -> AgentTrace:
     return trace
 
 
+def website_report_payload(website_report) -> dict[str, object]:
+    """Return a JSON-safe report payload across Streamlit cache/code versions.
+
+    Streamlit can retain an object created before newly-added diagnostic fields
+    existed.  ``getattr`` keeps a rerun from failing while still exposing all
+    diagnostics available on the current report.
+    """
+    if website_report is None:
+        return {}
+    fields = (
+        "requested_url",
+        "resolved_url",
+        "status_code",
+        "pages_discovered",
+        "pages_fetched",
+        "pages_rejected",
+        "indexed_pages",
+        "character_counts",
+        "errors",
+        "error_type",
+        "error_message",
+        "homepage_error",
+    )
+    return {field: getattr(website_report, field, None) for field in fields}
+
+
 def run_document(spec: DocumentSpec, retriever, status_box=None, reference_retriever=None, website_report=None) -> DocumentTrace:
     def on_event(message: str) -> None:
         if status_box:
@@ -72,20 +98,7 @@ def run_document(spec: DocumentSpec, retriever, status_box=None, reference_retri
     workflow = DocumentWorkflow(retriever, configured_reasoner(), max_section_iterations=2, reference_retriever=reference_retriever)
     trace = workflow.run(spec, on_event)
     if website_report is not None:
-        trace.website_report = {
-            "requested_url": website_report.requested_url,
-            "resolved_url": website_report.resolved_url,
-            "status_code": website_report.status_code,
-            "pages_discovered": website_report.pages_discovered,
-            "pages_fetched": website_report.pages_fetched,
-            "pages_rejected": website_report.pages_rejected,
-            "indexed_pages": website_report.indexed_pages,
-            "character_counts": website_report.character_counts,
-            "errors": website_report.errors,
-            "error_type": website_report.error_type,
-            "error_message": website_report.error_message,
-            "homepage_error": website_report.homepage_error,
-        }
+        trace.website_report = website_report_payload(website_report)
     on_event("Rendering DOCX/PDF")
     # Render once during the run so the demo proves the deliverable is
     # downloadable, while the bytes remain generated on demand below.

@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 from document_export import docx_bytes, markdown_bytes, pdf_bytes
 from document_models import DocumentSectionPlan, DocumentSpec, GeneratedSection, SectionAnalysis, SectionDraft, SectionQC
@@ -28,7 +29,7 @@ from models import AgentTrace, EvidenceChunk
 from uploaded_corpus import EmptyRetriever, clean_uploaded_text, diversify_results, extract_pdf_bytes
 from website_context import fetch_website_evidence
 import website_context
-from streamlit_app import MAX_BRIEF_LENGTH, default_client_brief
+from streamlit_app import MAX_BRIEF_LENGTH, default_client_brief, website_report_payload
 
 
 class DocumentFakeRetriever:
@@ -45,6 +46,28 @@ class DocumentFakeRetriever:
         if "pillar" in lower or "overview" in lower or "framework" in lower:
             return [EvidenceChunk(chunk_id=f"overview-{len(self.calls)}", page=8, section="Overview", text="The AWS Well-Architected Framework provides best practices to evaluate architectures and is based on six pillars.", score=0.9)]
         return [EvidenceChunk(chunk_id=f"reliability-{len(self.calls)}", page=10, section="Reliability", text="Fault isolated boundaries limit failures. Test recovery and disaster recovery plans.", score=0.9)]
+
+
+def test_website_report_payload_tolerates_cached_legacy_report_fields():
+    legacy_report = SimpleNamespace(
+        requested_url="https://example.test",
+        resolved_url="https://example.test",
+        status_code=200,
+        pages_discovered=[],
+        pages_fetched=[],
+        pages_rejected=[],
+        indexed_pages=[],
+        character_counts={},
+        errors=[],
+    )
+
+    payload = website_report_payload(legacy_report)
+
+    assert payload["requested_url"] == "https://example.test"
+    assert payload["status_code"] == 200
+    assert payload["error_type"] is None
+    assert payload["error_message"] is None
+    assert payload["homepage_error"] is None
 
 
 def make_workflow(**kwargs):
