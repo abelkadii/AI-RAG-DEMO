@@ -27,7 +27,8 @@ class UploadedRetriever:
         self.store = InMemoryVectorStore(chunks)
 
     def search(self, query: str, k: int = 6) -> list[EvidenceChunk]:
-        return self.store.search(query, k)
+        candidates = self.store.search(query, max(20, k * 3))
+        return diversify_results(candidates, k=k)
 
 
 def corpus_hash(files: list[UploadedPDF]) -> str:
@@ -89,6 +90,44 @@ def safe_source_name(name: str) -> str:
     return base[:80] or "Uploaded document"
 
 
+def diversify_results(candidates: list[EvidenceChunk], k: int = 6, max_per_page: int = 2) -> list[EvidenceChunk]:
+    """Select relevant chunks while reducing duplicate-page/topic collapse."""
+    if not candidates:
+        return []
+    max_score = max(chunk.score for chunk in candidates)
+    threshold = max_score * 0.35 if max_score > 0 else float("-inf")
+    pool = [chunk for chunk in candidates if chunk.score >= threshold]
+    selected: list[EvidenceChunk] = []
+    page_counts: dict[tuple[str, int], int] = {}
+    while pool and len(selected) < k:
+        best_index = 0
+        best_value = float("-inf")
+        for index, chunk in enumerate(pool):
+            page_key = (chunk.source, chunk.page)
+            if page_counts.get(page_key, 0) >= max_per_page:
+                continue
+            diversity_penalty = max((term_jaccard(chunk.text, picked.text) for picked in selected), default=0.0)
+            value = chunk.score - (0.18 * diversity_penalty)
+            if value > best_value:
+                best_index = index
+                best_value = value
+        if best_value == float("-inf"):
+            break
+        chosen = pool.pop(best_index)
+        selected.append(chosen)
+        page_key = (chosen.source, chosen.page)
+        page_counts[page_key] = page_counts.get(page_key, 0) + 1
+    return selected
+
+
+def term_jaccard(first: str, second: str) -> float:
+    first_terms = set(re.findall(r"[\w\u0600-\u06FF]{4,}", first.lower()))
+    second_terms = set(re.findall(r"[\w\u0600-\u06FF]{4,}", second.lower()))
+    if not first_terms or not second_terms:
+        return 0.0
+    return len(first_terms & second_terms) / len(first_terms | second_terms)
+
+
 def clean_uploaded_text(text: str, source: str) -> str:
     """Clean uploaded PDF text without discarding non-Latin scripts."""
     lines = []
@@ -108,6 +147,7 @@ def clean_uploaded_text(text: str, source: str) -> str:
             )
         )
         line = re.sub(r"\s+", " ", line).strip()
+        line = repair_hyphenation_artifacts(line)
         if not line:
             continue
         if re.fullmatch(r"\d+\s*/\s*\d+", line):
@@ -123,6 +163,12 @@ def clean_uploaded_text(text: str, source: str) -> str:
             continue
         lines.append(line)
     return clean_text(" ".join(lines))
+
+
+def repair_hyphenation_artifacts(text: str) -> str:
+    text = re.sub(r"\b([A-Za-z]{2,})-\s+([a-z]{2,})\b", r"\1\2", text)
+    text = re.sub(r"\b([A-Za-z]{2,})-\s*\n\s*([a-z]{2,})\b", r"\1\2", text)
+    return text
 
 
 def looks_like_footer_or_title_fragment(line: str) -> bool:

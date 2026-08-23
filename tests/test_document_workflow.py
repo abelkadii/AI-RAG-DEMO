@@ -1,9 +1,15 @@
 from document_export import docx_bytes, markdown_bytes
 from document_models import DocumentSpec, SectionQC
-from document_workflow import DEFAULT_BRIEF, DocumentWorkflow, resolve_deliverable_type, serializable_evidence
+from document_workflow import (
+    DEFAULT_BRIEF,
+    DocumentWorkflow,
+    citation_coverage_issues,
+    resolve_deliverable_type,
+    serializable_evidence,
+)
 from llm import LocalReasoner
 from models import EvidenceChunk
-from uploaded_corpus import clean_uploaded_text, extract_pdf_bytes
+from uploaded_corpus import clean_uploaded_text, diversify_results, extract_pdf_bytes
 
 
 class DocumentFakeRetriever:
@@ -41,7 +47,7 @@ def test_document_workflow_executes_end_to_end_with_fake_components():
     assert trace.plan.sections
     assert len(trace.sections) >= 5
     assert trace.final_markdown.startswith("# AWS Well-Architected")
-    assert trace.total_research_iterations >= len(trace.sections)
+    assert trace.total_research_iterations >= len([section for section in trace.sections if section.section_id != "evidence"])
     assert trace.final_qc.passed
 
 
@@ -132,8 +138,8 @@ def test_auto_summary_brief_uses_concise_summary_structure_without_roadmap():
     assert trace.plan.deliverable_type == "Summary / Brief"
     assert [section.section_id for section in trace.plan.sections] == [
         "overview",
-        "key-points",
-        "brief-explanation",
+        "major-themes",
+        "conclusion",
         "evidence",
     ]
     forbidden = ("Implementation Roadmap", "Prioritized Recommendations", "acceptance criteria", "rollout", "Priority 1")
@@ -141,11 +147,28 @@ def test_auto_summary_brief_uses_concise_summary_structure_without_roadmap():
     assert trace.final_qc.passed
 
 
+def test_document_workflow_does_not_research_references_section():
+    workflow = make_workflow()
+    trace = workflow.run(make_spec())
+    evidence_section = next(section for section in trace.sections if section.section_id == "evidence")
+    assert evidence_section.research_trace.stop_reason == "generated_from_used_citations"
+    assert not any("references evidence sources" in query.lower() for query in workflow.retriever.calls)
+
+
 def test_auto_classifies_research_and_consulting_briefs_differently():
     research = DocumentSpec(client_brief="summarize the methodology and findings", source_kind="uploaded")
     consulting = DocumentSpec(client_brief="identify risks, recommend remediations, give a 90-day roadmap", source_kind="uploaded")
     assert resolve_deliverable_type(research) == "Research Report"
     assert resolve_deliverable_type(consulting) == "Consulting Assessment"
+
+
+def test_summary_brief_overrides_mismatched_manual_curriculum_type():
+    spec = DocumentSpec(
+        client_brief="what does this talk about, explain briefly in 400 words",
+        source_kind="uploaded",
+        deliverable_type="Curriculum / Teaching Material",
+    )
+    assert resolve_deliverable_type(spec) == "Summary / Brief"
 
 
 def test_uploaded_text_cleaning_removes_slide_counters_and_fragments_preserves_arabic():
@@ -166,11 +189,51 @@ def test_uploaded_text_cleaning_removes_slide_counters_and_fragments_preserves_a
     assert "هذا العرض" in text
 
 
+def test_uploaded_text_cleaning_repairs_extraction_hyphenation():
+    text = clean_uploaded_text(
+        "The presentation explains re- quired program goals and expected outcomes.",
+        "Presentation.pdf",
+    )
+    assert "re- quired" not in text
+    assert "required program goals" in text
+
+
 def test_serializable_evidence_handles_hot_reload_model_identity():
     chunk = EvidenceChunk(chunk_id="doc-p001-c00", page=1, text="A complete source-backed sentence.", source="doc.pdf")
     serialized = serializable_evidence([chunk])
     assert serialized == [chunk.model_dump()]
     assert serialized[0]["source"] == "doc.pdf"
+
+
+def test_uploaded_retrieval_diversification_limits_per_page_without_forcing_irrelevance():
+    candidates = [
+        EvidenceChunk(chunk_id=f"p1-{index}", page=1, source="doc.pdf", text=f"alpha topic detail {index}", score=1.0 - index * 0.01)
+        for index in range(5)
+    ] + [
+        EvidenceChunk(chunk_id="p2-0", page=2, source="doc.pdf", text="beta topic detail", score=0.9),
+        EvidenceChunk(chunk_id="p3-0", page=3, source="doc.pdf", text="gamma topic detail", score=0.88),
+    ]
+    selected = diversify_results(candidates, k=5, max_per_page=2)
+    assert len(selected) == 4
+    assert sum(1 for chunk in selected if chunk.page == 1) <= 2
+    assert {chunk.page for chunk in selected} >= {1, 2, 3}
+
+
+def test_citation_coverage_flags_single_page_concentration_when_evidence_is_broad():
+    evidence = [
+        EvidenceChunk(chunk_id="p1", page=1, source="doc.pdf", text="Alpha topic explains data collection and project scope.", score=0.9),
+        EvidenceChunk(chunk_id="p2", page=2, source="doc.pdf", text="Beta topic explains methodology and evaluation.", score=0.8),
+        EvidenceChunk(chunk_id="p3", page=3, source="doc.pdf", text="Gamma topic explains findings and conclusions.", score=0.7),
+    ]
+    content = "\n\n".join(
+        [
+            "Alpha topic explains data collection. [doc.pdf p.1]",
+            "Alpha topic explains project scope. [doc.pdf p.1]",
+            "Alpha topic explains background. [doc.pdf p.1]",
+        ]
+    )
+    issues = citation_coverage_issues(content, evidence)
+    assert any("Citation concentration" in issue for issue in issues)
 
 
 def test_references_are_built_from_citations_used_in_report():

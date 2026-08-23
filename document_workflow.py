@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, Protocol
 
@@ -17,7 +18,7 @@ from document_models import (
     SectionQC,
 )
 from llm import Reasoner, configured_reasoner
-from models import CitationValidation, EvidenceChunk
+from models import AgentTrace, CitationValidation, EvidenceChunk
 from retriever import Retriever
 
 
@@ -28,6 +29,12 @@ DEFAULT_BRIEF = (
     "implementation roadmap. Every material factual claim must be grounded in the "
     "supplied framework."
 )
+
+
+@dataclass(frozen=True)
+class EvidenceClaim:
+    text: str
+    chunk: EvidenceChunk
 
 
 class SectionWriter(Protocol):
@@ -56,7 +63,7 @@ class DocumentWorkflow:
         retriever=None,
         reasoner: Reasoner | None = None,
         max_section_iterations: int = 3,
-        evidence_k: int = 5,
+        evidence_k: int = 8,
         section_writer: SectionWriter | None = None,
         qc_runner: QCRunner | None = None,
     ) -> None:
@@ -103,9 +110,9 @@ class DocumentWorkflow:
         deliverable_type = resolve_deliverable_type(spec)
         if deliverable_type == "Summary / Brief":
             sections = [
-                ("overview", "What This Document Covers", "Briefly explain the subject of the uploaded document.", f"main topic purpose subject overview {topic}"),
-                ("key-points", "Key Points", "Summarize the main points without adding recommendations.", f"main points themes summary {topic}"),
-                ("brief-explanation", "Brief Explanation", "Explain the document in plain language.", f"plain language explanation summary {topic}"),
+                ("overview", "Concise Overview", "Briefly explain the subject of the uploaded document.", "document title abstract introduction overview purpose subject"),
+                ("major-themes", "Major Themes / Findings", "Summarize the major themes or findings without adding recommendations.", "chapter headings main themes key findings results discussion"),
+                ("conclusion", "Conclusion", "Conclude what the document is mainly saying without adding operational advice.", "conclusion final summary implications closing findings"),
                 ("evidence", "Evidence / References", "List the source pages cited by the brief.", f"references evidence sources {topic}"),
             ]
         elif deliverable_type == "Research Report":
@@ -163,6 +170,28 @@ class DocumentWorkflow:
         evidence_by_id: dict[str, EvidenceChunk] = {}
 
         for section_plan in plan.sections:
+            if section_plan.section_id == "evidence":
+                self._event(on_event, "Building Evidence / References from used citations")
+                generated_sections.append(
+                    GeneratedSection(
+                        section_id=section_plan.section_id,
+                        title=section_plan.title,
+                        objective=section_plan.objective,
+                        content_markdown="References are generated from citations used in the previous sections.",
+                        evidence=[],
+                        research_trace=AgentTrace(
+                            question=section_plan.research_question,
+                            stop_reason="generated_from_used_citations",
+                        ),
+                        qc=SectionQC(
+                            passed=True,
+                            requirements_covered=["references-generated"],
+                            citation_valid=True,
+                        ),
+                    )
+                )
+                self._event(on_event, "Evidence / References generated")
+                continue
             self._event(on_event, f"Researching {section_plan.title}")
             state, research_trace = Agent(
                 self.retriever,
@@ -319,84 +348,91 @@ class EvidenceGroundedSectionWriter:
     ) -> str:
         if section.section_id == "evidence":
             return "References are generated deterministically from citations used in the report."
-        synthesis = synthesize_evidence(evidence)
-        if not synthesis:
+        claims = synthesize_evidence_claims(evidence, limit=8)
+        if not claims:
             return f"This section needs human review because no source evidence was retrieved for the objective. {citation}".strip()
         brief_focus = brief_focus_sentence(spec.client_brief)
-        first, second = synthesis[0], synthesis[min(1, len(synthesis) - 1)]
+        first = claims[0]
+        second = claims[min(1, len(claims) - 1)]
         deliverable_type = resolve_deliverable_type(spec)
         if deliverable_type == "Summary / Brief":
             if section.section_id == "overview":
-                return f"The uploaded document appears to discuss {first} {citation}"
-            if section.section_id == "key-points":
-                points = synthesis[:3]
-                return "\n".join(f"- Point {index}: {point} {citation}" for index, point in enumerate(points, start=1))
-            if section.section_id == "brief-explanation":
+                supporting = claims[:2]
+                cited = " ".join(citation_for_claim(claim, evidence) for claim in supporting)
                 return (
-                    f"In brief, the source presents {first.lower()} {citation}\n\n"
-                    f"It also points to {second.lower()} {citation}\n\n"
-                    f"This explanation is limited to the uploaded evidence and the user's request: {brief_focus}. {citation}"
+                    f"The uploaded document appears to focus on {join_claims(supporting).lower()} {cited}"
+                )
+            if section.section_id == "major-themes":
+                points = claims[:4]
+                return "\n".join(
+                    f"- Theme {index}: {claim.text} {citation_for_claim(claim, evidence)}"
+                    for index, claim in enumerate(points, start=1)
+                )
+            if section.section_id == "conclusion":
+                return (
+                    f"In brief, the source presents {first.text.lower()} {citation_for_claim(first, evidence)}\n\n"
+                    f"It also points to {second.text.lower()} {citation_for_claim(second, evidence)}"
                 )
         if deliverable_type == "Research Report":
             if section.section_id == "executive-summary":
-                return f"This research report summarizes the uploaded evidence around {first.lower()} {citation}"
+                return f"This research report summarizes the uploaded evidence around {first.text.lower()} {citation_for_claim(first, evidence)}"
             if section.section_id == "methodology":
-                return f"The methodology or approach described in the source centers on {first.lower()} {citation}"
+                return f"The methodology or approach described in the source centers on {first.text.lower()} {citation_for_claim(first, evidence)}"
             if section.section_id == "findings":
-                return f"The main evidence-backed findings are {first.lower()} and {second.lower()} {citation}"
+                return f"The main evidence-backed findings are {first.text.lower()} {citation_for_claim(first, evidence)} and {second.text.lower()} {citation_for_claim(second, evidence)}"
             if section.section_id == "interpretation":
-                return f"Taken together, the evidence suggests that {first.lower()} {citation}"
+                return f"Taken together, the evidence suggests that {first.text.lower()} {citation_for_claim(first, evidence)}"
         if deliverable_type == "Curriculum / Teaching Material":
             if section.section_id == "overview":
-                return f"This teaching material covers {first.lower()} {citation}"
+                return f"This teaching material covers {first.text.lower()} {citation_for_claim(first, evidence)}"
             if section.section_id == "concepts":
-                return "\n".join(f"- Concept {index}: {point} {citation}" for index, point in enumerate(synthesis[:3], start=1))
+                return "\n".join(
+                    f"- Concept {index}: {claim.text} {citation_for_claim(claim, evidence)}"
+                    for index, claim in enumerate(claims[:3], start=1)
+                )
             if section.section_id == "teaching-notes":
-                return f"Teaching notes should explain {first.lower()} and connect it to {second.lower()} {citation}"
+                return f"Teaching notes should explain {first.text.lower()} {citation_for_claim(first, evidence)} and connect it to {second.text.lower()} {citation_for_claim(second, evidence)}"
         if section.section_id == "executive-summary":
             return (
                 f"This assessment responds to the requested brief for {spec.audience}. "
-                f"The source evidence emphasizes {first.lower()} {citation}\n\n"
-                f"- The requested focus is: {brief_focus}. {citation}\n"
-                f"- Findings and recommendations are limited to retrieved source evidence. {citation}"
+                f"The source evidence emphasizes {first.text.lower()} {citation_for_claim(first, evidence)}\n\n"
+                f"- The requested focus is: {brief_focus}.\n"
+                f"- Findings and recommendations are limited to retrieved source evidence."
             )
         if section.section_id == "scope-objectives":
             return (
-                f"The scope is defined by the uploaded documents and the client brief. {citation}\n\n"
-                f"The objective is to produce an evidence-grounded deliverable for {spec.audience} that matches the requested output type: {deliverable_type}. {citation}"
+                f"The scope is defined by the uploaded documents and the client brief.\n\n"
+                f"The objective is to produce an evidence-grounded deliverable for {spec.audience} that matches the requested output type: {deliverable_type}."
             )
         if section.section_id == "findings":
             return (
-                f"Key finding 1: {first} {citation}\n\n"
-                f"Key finding 2: {second} {citation}\n\n"
-                f"These findings should be interpreted against the uploaded source context rather than generalized beyond it. {citation}"
+                f"Key finding 1: {first.text} {citation_for_claim(first, evidence)}\n\n"
+                f"Key finding 2: {second.text} {citation_for_claim(second, evidence)}\n\n"
+                f"These findings should be interpreted against the uploaded source context rather than generalized beyond it."
             )
         if section.section_id == "analysis":
             return (
-                f"The evidence suggests the key issue is how the requested objective connects to the documented source material. {citation}\n\n"
-                f"In practical terms, {first} {citation}\n\n"
-                f"This creates an analysis basis for recommendations without adding unsupported external claims. {citation}"
+                f"The evidence suggests the key issue is how the requested objective connects to the documented source material.\n\n"
+                f"In practical terms, {first.text} {citation_for_claim(first, evidence)}\n\n"
+                f"This creates an analysis basis for recommendations without adding unsupported external claims."
             )
         if section.section_id == "recommendations":
             if not requests_actions(spec.client_brief):
-                return f"The brief does not request recommendations, so this section limits itself to the evidence-backed point that {first.lower()} {citation}"
+                return f"The brief does not request recommendations, so this section limits itself to the evidence-backed point that {first.text.lower()} {citation_for_claim(first, evidence)}"
             return (
-                f"Priority 1: address the highest-impact item described in the uploaded material: {first} {citation}\n\n"
-                f"Priority 2: use the supporting source evidence to define practical next steps: {second} {citation}\n\n"
-                f"Priority 3: validate the recommendations with the document owner before operational rollout. {citation}"
+                f"Priority 1: address the highest-impact item described in the uploaded material: {first.text} {citation_for_claim(first, evidence)}\n\n"
+                f"Priority 2: use the supporting source evidence to define practical next steps: {second.text} {citation_for_claim(second, evidence)}"
             )
         if section.section_id == "roadmap":
             if not requests_roadmap(spec.client_brief):
-                return f"The brief does not request an implementation roadmap; the evidence-backed summary is that {first.lower()} {citation}"
+                return f"The brief does not request an implementation roadmap; the evidence-backed summary is that {first.text.lower()} {citation_for_claim(first, evidence)}"
             return (
-                f"This roadmap sequences the source-backed work into practical phases. {citation}\n\n"
-                f"Near term: confirm the source-backed findings and assign ownership. {citation}\n\n"
-                f"Next phase: convert the findings into specific work items, acceptance criteria, and review checkpoints. {citation}\n\n"
-                f"Later phase: review outcomes against the original brief and update the document set as source knowledge evolves. {citation}"
+                f"This roadmap sequences source-backed work from {first.text.lower()} {citation_for_claim(first, evidence)}\n\n"
+                f"Next phase: use the additional evidence that {second.text.lower()} {citation_for_claim(second, evidence)}"
             )
         if section.section_id in {"overview", "key-points", "response"}:
-            return f"{first} {citation}"
-        return f"{section.title}: {first} {citation}"
+            return f"{first.text} {citation_for_claim(first, evidence)}"
+        return f"{section.title}: {first.text} {citation_for_claim(first, evidence)}"
 
 
 class DeterministicSectionQC:
@@ -444,6 +480,8 @@ def section_requirements(section: DocumentSectionPlan) -> list[str]:
         "analysis": ["analysis"],
         "overview": [],
         "key-points": ["point"],
+        "major-themes": ["theme"],
+        "conclusion": [],
         "brief-explanation": [],
         "methodology": ["methodology"],
         "interpretation": ["evidence"],
@@ -455,6 +493,8 @@ def section_requirements(section: DocumentSectionPlan) -> list[str]:
 
 
 def resolve_deliverable_type(spec: DocumentSpec) -> str:
+    if has_strong_summary_intent(spec.client_brief):
+        return "Summary / Brief"
     if spec.deliverable_type != "Auto":
         return spec.deliverable_type
     brief = spec.client_brief.lower()
@@ -464,9 +504,14 @@ def resolve_deliverable_type(spec: DocumentSpec) -> str:
         return "Consulting Assessment"
     if any(term in brief for term in ("methodology", "findings", "study", "research", "results", "literature")):
         return "Research Report"
-    if any(term in brief for term in ("what does this talk about", "explain briefly", "briefly", "short summary", "summarize", "summary")):
+    if has_strong_summary_intent(spec.client_brief):
         return "Summary / Brief"
     return "Custom"
+
+
+def has_strong_summary_intent(brief: str) -> bool:
+    lower = brief.lower()
+    return any(term in lower for term in ("what does this talk about", "explain briefly", "briefly", "short summary", "summarize this", "summary"))
 
 
 def requests_actions(brief: str) -> bool:
@@ -546,7 +591,11 @@ def deterministic_content_checks(
     if evidence and not semantically_supported(content, evidence):
         issues.append("The cited evidence may not semantically support the section claim.")
         unsupported.append("Low semantic overlap with retrieved evidence")
-    if deliverable_type == "Summary / Brief" and section.section_id not in {"overview", "key-points", "brief-explanation", "evidence"}:
+    citation_issues = citation_coverage_issues(content, evidence) if spec.source_kind == "uploaded" else []
+    if citation_issues:
+        issues.extend(citation_issues)
+        unsupported.extend(citation_issues)
+    if deliverable_type == "Summary / Brief" and section.section_id not in {"overview", "major-themes", "conclusion", "evidence"}:
         missing.append("summary structure")
         issues.append("Plan section does not match a concise summary deliverable.")
     passed = not issues and not missing
@@ -597,13 +646,69 @@ def semantically_supported(content: str, evidence: list[EvidenceChunk]) -> bool:
     return len(claim_terms & evidence_terms) >= max(2, min(5, len(claim_terms) // 8))
 
 
+def citation_coverage_issues(content: str, evidence: list[EvidenceChunk]) -> list[str]:
+    issues: list[str] = []
+    evidence_pages = {(chunk.source, chunk.page) for chunk in evidence}
+    if len(evidence_pages) <= 1:
+        return issues
+    factual_paragraphs = [
+        paragraph.strip()
+        for paragraph in re.split(r"\n\s*\n", content)
+        if re.search(r"[A-Za-z\u0600-\u06FF]{4,}", paragraph)
+    ]
+    cited_pairs = []
+    for paragraph in factual_paragraphs:
+        cited_pairs.extend((match.group(1), int(match.group(2))) for match in re.finditer(r"\[([^\[\]\n]+?) p\.(\d+)\]", paragraph))
+    if not cited_pairs:
+        return issues
+    page_counts: dict[tuple[str, int], int] = {}
+    for pair in cited_pairs:
+        page_counts[pair] = page_counts.get(pair, 0) + 1
+    dominant = max(page_counts.values()) / max(1, len(cited_pairs))
+    if dominant > 0.80 and len(evidence_pages) >= 3 and len(factual_paragraphs) >= 3:
+        issues.append("Citation concentration is suspicious: more than 80% of cited factual paragraphs rely on one page despite multi-page evidence.")
+    output_pages = set(cited_pairs)
+    if len(evidence_pages) >= 3 and len(output_pages) == 1:
+        issues.append("Section evidence spans several pages but output cites only one page.")
+    for sentence in cited_sentences(content):
+        cited = [(match.group(1), int(match.group(2))) for match in re.finditer(r"\[([^\[\]\n]+?) p\.(\d+)\]", sentence)]
+        if not cited:
+            continue
+        if not any(pair_supports_sentence(pair, sentence, evidence) for pair in cited):
+            issues.append("A cited page does not appear to support its associated sentence.")
+            break
+    return issues
+
+
+def cited_sentences(content: str) -> list[str]:
+    normalized = re.sub(r"\n+", " ", content)
+    return [item.strip() for item in re.split(r"(?<=[.!?؟])\s+", normalized) if "[" in item and "]" in item]
+
+
+def pair_supports_sentence(pair: tuple[str, int], sentence: str, evidence: list[EvidenceChunk]) -> bool:
+    sentence_terms = {
+        term
+        for term in re.findall(r"[\w\u0600-\u06FF]{4,}", re.sub(r"\[[^\]]+\]", "", sentence).lower())
+        if term not in STOP_TERMS
+    }
+    page_terms = {
+        term
+        for chunk in evidence
+        if (chunk.source, chunk.page) == pair
+        for term in re.findall(r"[\w\u0600-\u06FF]{4,}", chunk.text.lower())
+        if term not in STOP_TERMS
+    }
+    if not sentence_terms:
+        return True
+    return len(sentence_terms & page_terms) >= max(2, min(4, len(sentence_terms) // 6))
+
+
 def revise_section(content: str, qc: SectionQC, evidence: list[EvidenceChunk], spec: DocumentSpec | None = None, plan: DocumentPlan | None = None) -> str:
     if plan and plan.deliverable_type == "Summary / Brief":
-        citation = cite_page(evidence)
-        summary = synthesize_evidence(evidence, limit=2)
-        if not summary:
+        claims = synthesize_evidence_claims(evidence, limit=2)
+        if not claims:
             return content
-        return "\n\n".join(f"{point} {citation}" for point in summary)
+        return "\n\n".join(f"{claim.text} {citation_for_claim(claim, evidence)}" for claim in claims)
     citation = cite_page(evidence)
     additions = []
     for requirement in qc.missing_requirements:
@@ -718,6 +823,74 @@ def best_snippets(evidence: list[EvidenceChunk], limit: int = 3) -> list[str]:
     if snippets:
         return snippets
     return [chunk.text[:220].strip().rstrip(".") for chunk in evidence[:limit] if chunk.text.strip()]
+
+
+def synthesize_evidence_claims(evidence: list[EvidenceChunk], limit: int = 6) -> list[EvidenceClaim]:
+    candidates: list[EvidenceClaim] = []
+    seen = set()
+    for chunk in sorted(evidence, key=lambda item: item.score, reverse=True):
+        for sentence in re.split(r"(?<=[.!?؟])\s+", chunk.text):
+            cleaned = normalize_claim_text(sentence)
+            if not useful_evidence_sentence(cleaned):
+                continue
+            key = re.sub(r"\W+", " ", cleaned.lower())[:90]
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(EvidenceClaim(text=compress_claim(cleaned), chunk=chunk))
+            break
+    return diversify_claims(candidates, limit)
+
+
+def diversify_claims(candidates: list[EvidenceClaim], limit: int) -> list[EvidenceClaim]:
+    selected: list[EvidenceClaim] = []
+    pages_available = {(claim.chunk.source, claim.chunk.page) for claim in candidates}
+    page_counts: dict[tuple[str, int], int] = {}
+    for claim in candidates:
+        page_key = (claim.chunk.source, claim.chunk.page)
+        if len(pages_available) > 1 and page_counts.get(page_key, 0) >= 2:
+            continue
+        selected.append(claim)
+        page_counts[page_key] = page_counts.get(page_key, 0) + 1
+        if len(selected) >= limit:
+            break
+    if len(selected) < min(limit, len(candidates)):
+        for claim in candidates:
+            if claim not in selected:
+                selected.append(claim)
+            if len(selected) >= limit:
+                break
+    return selected[:limit]
+
+
+def citation_for_claim(claim: EvidenceClaim, evidence: list[EvidenceChunk]) -> str:
+    claim_terms = {
+        term
+        for term in re.findall(r"[\w\u0600-\u06FF]{4,}", claim.text.lower())
+        if term not in STOP_TERMS
+    }
+    best = claim.chunk
+    best_score = -1.0
+    for chunk in evidence:
+        chunk_terms = {
+            term
+            for term in re.findall(r"[\w\u0600-\u06FF]{4,}", chunk.text.lower())
+            if term not in STOP_TERMS
+        }
+        score = len(claim_terms & chunk_terms) + chunk.score
+        if score > best_score:
+            best = chunk
+            best_score = score
+    return f"[{best.source} p.{best.page}]"
+
+
+def join_claims(claims: list[EvidenceClaim]) -> str:
+    texts = [claim.text.rstrip(".") for claim in claims if claim.text.strip()]
+    if not texts:
+        return ""
+    if len(texts) == 1:
+        return texts[0]
+    return "; ".join(texts[:-1]) + f"; and {texts[-1]}"
 
 
 def synthesize_evidence(evidence: list[EvidenceChunk], limit: int = 3) -> list[str]:
