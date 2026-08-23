@@ -79,6 +79,11 @@ def run_document(spec: DocumentSpec, retriever, status_box=None, reference_retri
     return trace
 
 
+def default_client_brief(source_choice: str) -> str:
+    """Keep the zero-setup AWS example separate from uploaded workflows."""
+    return DEFAULT_BRIEF if source_choice == "Built-in AWS sample" else ""
+
+
 @st.cache_resource(show_spinner=False)
 def cached_uploaded_retriever(cache_key: str, _files_payload: tuple[tuple[str, bytes], ...]):
     files = [UploadedPDF(name=name, content=content) for name, content in _files_payload]
@@ -370,12 +375,16 @@ def document_studio() -> None:
                 value=default_title,
                 max_chars=MAX_TITLE_LENGTH,
             )
-            default_brief = DEFAULT_BRIEF if source_choice == "Built-in AWS sample" else (
-                "what does this talk about, explain briefly"
-            )
+            default_brief = default_client_brief(source_choice)
             brief = st.text_area(
                 "Client brief / report requirements",
                 value=default_brief,
+                key=f"client_brief_{'aws' if source_choice == 'Built-in AWS sample' else 'uploaded'}",
+                placeholder=(
+                    "Example: What does this document cover? Explain the main themes in 400 words."
+                    if source_choice == "Upload documents"
+                    else None
+                ),
                 max_chars=MAX_BRIEF_LENGTH,
                 height=360,
                 help=f"Long multi-paragraph scopes are supported up to {MAX_BRIEF_LENGTH:,} characters. The report is grounded only in client sources, the brief, and bounded website context.",
@@ -567,7 +576,7 @@ def render_document_results(trace: DocumentTrace) -> None:
     st.caption(f"Sections revised once by QC: {revised}")
     st.caption(
         f"Reference precedent: {', '.join(trace.spec.reference_source_names) if trace.spec.reference_source_names else 'None'} | "
-        f"Client sources: {', '.join(trace.spec.client_source_names) if trace.spec.client_source_names else 'Client brief'} | "
+        f"Client sources: {', '.join(trace.spec.client_source_names) if trace.spec.client_source_names else ('No client PDFs; website/public evidence only' if trace.spec.source_kind == 'uploaded' else 'AWS sample corpus')} | "
         f"Website: {trace.spec.company_website or 'None'}"
     )
 

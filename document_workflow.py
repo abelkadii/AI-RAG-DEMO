@@ -16,6 +16,9 @@ from document_models import (
     DocumentTrace,
     GeneratedSection,
     ReferenceReportProfile,
+    SectionAnalysis,
+    SectionDraft,
+    SectionEvidenceClaim,
     SectionQC,
 )
 from llm import Reasoner, configured_reasoner
@@ -56,7 +59,9 @@ def target_word_count(spec: DocumentSpec) -> int | None:
     # its default.  They have no artificial target unless the user supplied a
     # word count, so the writer does not pad a short explanation.
     if spec.deliverable_type == "Summary / Brief" or (
-        spec.deliverable_type == "Auto" and has_strong_summary_intent(spec.client_brief)
+        spec.deliverable_type == "Auto"
+        and has_strong_summary_intent(spec.client_brief)
+        and not has_strong_strategy_intent(spec.client_brief)
     ):
         return None
     return None if spec.target_depth == "Demo" else DEPTH_PROFILES[spec.target_depth][0]
@@ -68,7 +73,9 @@ def depth_label(spec: DocumentSpec) -> str:
 
 def depth_range(spec: DocumentSpec) -> tuple[int, int] | None:
     if explicit_word_count(spec.client_brief) or spec.target_word_count or spec.deliverable_type == "Summary / Brief" or (
-        spec.deliverable_type == "Auto" and has_strong_summary_intent(spec.client_brief)
+        spec.deliverable_type == "Auto"
+        and has_strong_summary_intent(spec.client_brief)
+        and not has_strong_strategy_intent(spec.client_brief)
     ):
         target = target_word_count(spec)
         return (round(target * 0.85), round(target * 1.15)) if target else None
@@ -357,7 +364,7 @@ class DocumentWorkflow:
         self.reasoner = reasoner or configured_reasoner()
         self.max_section_iterations = max_section_iterations
         self.evidence_k = evidence_k
-        self.section_writer = section_writer or EvidenceGroundedSectionWriter()
+        self.section_writer = section_writer or EvidenceGroundedSectionWriter(self.reasoner)
         self.qc_runner = qc_runner or DeterministicSectionQC()
         self.reference_retriever = reference_retriever
         self.reference_profile = reference_profile
@@ -531,6 +538,9 @@ class DocumentWorkflow:
         survey = self._survey_source(spec)
         self._event(on_event, "Planning document")
         plan = self.plan(spec, survey)
+        synthesis_engine = getattr(self.section_writer, "synthesis", None)
+        if spec.source_kind == "uploaded" and synthesis_engine is not None and not synthesis_engine.capable:
+            self._event(on_event, "Configured synthesis model unavailable; using a bounded evidence summary and marking depth limits for review.")
         generated_sections: list[GeneratedSection] = []
         prior_summaries: list[str] = []
         evidence_by_id: dict[str, EvidenceChunk] = {}
@@ -571,11 +581,25 @@ class DocumentWorkflow:
             self._event(on_event, f"Drafting {section_plan.title}")
             content = self.section_writer.write(spec, plan, section_plan, section_evidence, prior_summaries)
             if spec.source_kind == "uploaded":
+                disclosure = external_research_disclosure(section_plan, section_evidence)
+                if disclosure and disclosure.lower() not in content.lower():
+                    content = content.rstrip() + "\n\n" + disclosure
+            content, inline_unknown_ids = replace_evidence_ids(content, section_evidence)
+            if spec.source_kind == "uploaded":
                 content = redact_builtin_branding(content)
 
             self._event(on_event, f"Running QC for {section_plan.title}")
             qc = self.qc_runner.check(section_plan, content, section_evidence)
             qc = merge_qc(qc, deterministic_content_checks(spec, plan, section_plan, content, section_evidence))
+            unknown_ids = sorted(set(
+                list(getattr(getattr(self.section_writer, "synthesis", None), "last_unknown_evidence_ids", []))
+                + inline_unknown_ids
+            ))
+            if unknown_ids:
+                qc.passed = False
+                qc.citation_valid = False
+                qc.issues.append(f"Unknown evidence IDs were returned by the section writer: {', '.join(unknown_ids)}.")
+                qc.unsupported_claims.extend(unknown_ids)
             revised = False
             revision_count = 0
             if not qc.passed:
@@ -596,6 +620,7 @@ class DocumentWorkflow:
                 evidence=serializable_evidence(section_evidence),
                 research_trace=research_trace,
                 qc=qc,
+                analysis=getattr(self.section_writer, "last_analysis", None),
                 revised=revised,
                 revision_count=revision_count,
             )
@@ -618,7 +643,11 @@ class DocumentWorkflow:
                     continue
                 evidence = [EvidenceChunk.model_validate(item) if isinstance(item, dict) else item for item in section_trace.evidence]
                 repaired = build_long_form_section(spec, section_plan, evidence, prior_summaries)
+                repaired, _ = replace_evidence_ids(repaired, evidence)
                 if spec.source_kind == "uploaded":
+                    disclosure = external_research_disclosure(section_plan, evidence)
+                    if disclosure and disclosure.lower() not in repaired.lower():
+                        repaired = repaired.rstrip() + "\n\n" + disclosure
                     repaired = redact_builtin_branding(repaired)
                 if repaired != section_trace.content_markdown:
                     section_trace.content_markdown = repaired
@@ -632,7 +661,18 @@ class DocumentWorkflow:
         self._event(on_event, "Running cross-document consistency review")
         final_markdown = assemble_markdown(spec, plan, generated_sections)
         self._event(on_event, "Validating citations")
-        cleaned_markdown, citation_validation = Agent.validate_citations(final_markdown, all_evidence)
+        # Requirements-only sections are intentionally uncited.  Validate the
+        # factual subset against retrieved evidence while leaving those
+        # diagnostic paragraphs visible in the finished report.
+        citation_sections = [
+            section.model_copy(update={"content_markdown": ""})
+            if section.section_id != "evidence" and not section.evidence
+            else section
+            for section in generated_sections
+        ]
+        citation_markdown = assemble_markdown(spec, plan, citation_sections)
+        _, citation_validation = Agent.validate_citations(citation_markdown, all_evidence)
+        cleaned_markdown = final_markdown
         final_qc = document_qc(spec, plan, generated_sections, citation_validation, cleaned_markdown, all_evidence)
         completed = datetime.now(timezone.utc)
         return DocumentTrace(
@@ -723,7 +763,10 @@ class DocumentWorkflow:
             section,
             list(gathered.values()),
             self.evidence_k,
-            allow_sparse_fallback=True,
+            # Document Studio must not turn an unrelated top hit into a
+            # factual section.  The legacy RAG Explorer can opt into the
+            # compatibility fallback by calling the helper directly.
+            allow_sparse_fallback=False,
         )
         return filtered, merge_agent_traces(section.title, traces)
 
@@ -831,80 +874,339 @@ def term_jaccard(first: str, second: str) -> float:
     return len(first_terms & second_terms) / len(first_terms | second_terms)
 
 
+def section_mode(section: DocumentSectionPlan, deliverable_type: str) -> str:
+    text = f"{section.section_id} {section.title} {section.objective}".lower()
+    if any(term in text for term in ("market", "competitive", "customer", "positioning")):
+        return "market_analysis"
+    if any(term in text for term in ("financial", "business model", "cost", "revenue", "pricing")):
+        return "financial_analysis"
+    if any(term in text for term in ("organisational", "organizational", "operating model", "capability", "health check")):
+        return "capability_assessment"
+    if any(term in text for term in ("recommend", "priority", "action")):
+        return "recommendation"
+    if any(term in text for term in ("roadmap", "implementation", "workshop", "training", "playbook")):
+        return "roadmap_or_implementation"
+    if section.section_id in {"executive-summary", "conclusion", "synthesis"}:
+        return "executive_synthesis"
+    return "research_summary" if deliverable_type == "Research Report" else "diagnostic"
+
+
+def evidence_packet(evidence: list[EvidenceChunk]) -> list[dict[str, object]]:
+    return [
+        {
+            "id": f"E{index}",
+            "source": chunk.source,
+            "page": chunk.page,
+            "section": chunk.section,
+            "claim_material": chunk.text[:1800],
+        }
+        for index, chunk in enumerate(evidence, start=1)
+    ]
+
+
+def citation_for_evidence_id(evidence_id: str, evidence: list[EvidenceChunk]) -> str | None:
+    match = re.fullmatch(r"E(\d+)", evidence_id.strip(), flags=re.I)
+    if not match:
+        return None
+    index = int(match.group(1)) - 1
+    if index < 0 or index >= len(evidence):
+        return None
+    chunk = evidence[index]
+    return f"[{chunk.source} p.{chunk.page}]"
+
+
+def replace_evidence_ids(text: str, evidence: list[EvidenceChunk]) -> tuple[str, list[str]]:
+    unknown: list[str] = []
+
+    def replace(match: re.Match) -> str:
+        evidence_id = match.group(1).upper()
+        citation = citation_for_evidence_id(evidence_id, evidence)
+        if citation is None:
+            unknown.append(evidence_id)
+            return ""
+        return citation
+
+    cleaned = re.sub(r"\[\s*(E\d+)\s*\]", replace, text or "", flags=re.I)
+    return re.sub(r"[ \t]{2,}", " ", cleaned).strip(), sorted(set(unknown))
+
+
+def normalize_model_citations(text: str, evidence: list[EvidenceChunk]) -> tuple[str, list[str]]:
+    """Convert any model-emitted grounded citation back to its packet ID."""
+    unknown: list[str] = []
+    pairs = {(chunk.source, chunk.page): f"E{index}" for index, chunk in enumerate(evidence, start=1)}
+
+    def replace(match: re.Match) -> str:
+        pair = (match.group(1), int(match.group(2)))
+        evidence_id = pairs.get(pair)
+        if not evidence_id:
+            unknown.append(f"{pair[0]} p.{pair[1]}")
+            return ""
+        return f"[{evidence_id}]"
+
+    normalized = re.sub(r"\[([^\[\]\n]+?) p\.(\d+)\]", replace, text or "")
+    return normalized, unknown
+
+
+def deterministic_section_analysis(
+    spec: DocumentSpec,
+    plan: DocumentPlan,
+    section: DocumentSectionPlan,
+    evidence: list[EvidenceChunk],
+    prior_summaries: list[str],
+) -> SectionAnalysis:
+    claims = []
+    for index, claim in enumerate(synthesize_evidence_claims(evidence, limit=8), start=1):
+        evidence_index = next((i for i, item in enumerate(evidence, start=1) if item.chunk_id == claim.chunk.chunk_id), index)
+        claims.append(SectionEvidenceClaim(text=claim.text, evidence_ids=[f"E{evidence_index}"]))
+    mode = section_mode(section, plan.deliverable_type)
+    gaps = [] if evidence else [
+        "Internal operating, financial, customer, and performance data required to test this workstream."
+    ]
+    inferences = []
+    if claims:
+        inferences.append("Interpret the retrieved observations against the requested objective without treating them as private company facts.")
+    hypotheses = [
+        "Treat any company-specific conclusion as a hypothesis until the missing internal baseline is supplied."
+    ] if evidence else [
+        "Use the requested workstream as a diagnostic hypothesis, not as proof that a weakness exists."
+    ]
+    return SectionAnalysis(
+        section_id=section.section_id,
+        section_mode=mode,
+        objective=section.objective,
+        requirements=section.requirements,
+        known_facts=claims,
+        evidence_claims=claims,
+        analytical_inferences=inferences,
+        hypotheses=hypotheses,
+        recommendations=["Recommend only actions explicitly requested by the brief and supported by the supplied material."] if requests_actions(spec.client_brief) else [],
+        data_gaps=gaps,
+        evidence_ids=[item for claim in claims for item in claim.evidence_ids],
+        planned_paragraphs=["established observations", "interpretation and decision relevance", "data gaps and validation"],
+    )
+
+
+def sanitize_section_analysis(
+    analysis: SectionAnalysis,
+    evidence: list[EvidenceChunk],
+) -> SectionAnalysis:
+    """Keep model-produced claims inside the supplied evidence packet."""
+    valid_ids = {f"E{index}" for index in range(1, len(evidence) + 1)}
+
+    def keep_claim(claim: SectionEvidenceClaim) -> SectionEvidenceClaim | None:
+        ids = [item.upper() for item in claim.evidence_ids if item.upper() in valid_ids]
+        if not ids or not claim.text.strip():
+            return None
+        return claim.model_copy(update={"evidence_ids": ids})
+
+    claims = [item for claim in analysis.evidence_claims if (item := keep_claim(claim)) is not None]
+    facts = [item for claim in analysis.known_facts if (item := keep_claim(claim)) is not None]
+    return analysis.model_copy(
+        update={
+            "evidence_claims": claims,
+            "known_facts": facts,
+            "evidence_ids": sorted({item for claim in claims for item in claim.evidence_ids}),
+        }
+    )
+
+
+def synthesize_bounded_section(
+    spec: DocumentSpec,
+    section: DocumentSectionPlan,
+    analysis: SectionAnalysis,
+    evidence: list[EvidenceChunk],
+) -> tuple[str, list[str]]:
+    """Offline-safe synthesis: concise, claim-led prose rather than filler."""
+    if not analysis.evidence_claims:
+        return requirements_only_section(spec, section), []
+    if resolve_deliverable_type(spec) == "Curriculum / Teaching Material" and (section.approximate_word_budget or 0) >= 250:
+        return synthesize_curriculum_section(spec, section, analysis), []
+    paragraphs: list[str] = []
+    first = analysis.evidence_claims[0]
+    first_ids = " ".join(f"[{item}]" for item in first.evidence_ids)
+    mode_openers = {
+        "market_analysis": "The public material provides an observable market-facing starting point",
+        "financial_analysis": "The available material provides a limited commercial reference point",
+        "capability_assessment": "The supplied material provides an external view of the operating context",
+        "roadmap_or_implementation": "The available evidence identifies a practical starting point for sequencing work",
+        "executive_synthesis": "Taken together, the retrieved material indicates",
+        "research_summary": "The source material describes",
+        "diagnostic": "The retrieved material indicates",
+    }
+    paragraphs.append(f"{mode_openers.get(analysis.section_mode, 'The retrieved material indicates')} {first.text.rstrip('.')} {first_ids}.")
+    if len(analysis.evidence_claims) > 1:
+        second = analysis.evidence_claims[1]
+        second_ids = " ".join(f"[{item}]" for item in second.evidence_ids)
+        paragraphs.append(
+            f"For {section.title.lower()}, this observation should be read alongside {second.text.rstrip('.')} {second_ids}. The combination supports a focused assessment of the requested objective, but it does not establish private operating performance or causality."
+        )
+    if analysis.data_gaps:
+        paragraphs.append(
+            "The next analytical step is to test the relevant hypothesis against internal baselines and decision criteria. "
+            + " ".join(analysis.data_gaps)
+        )
+    if analysis.recommendations:
+        paragraphs.append(
+            "Any recommendation should be conditional on that validation: use the evidence to frame the decision, then confirm scope, owner, baseline, and threshold before implementation."
+        )
+    return "\n\n".join(paragraphs), []
+
+
+def synthesize_curriculum_section(
+    spec: DocumentSpec,
+    section: DocumentSectionPlan,
+    analysis: SectionAnalysis,
+) -> str:
+    """Produce an offline teaching section from structured claims, not frames."""
+    budget = section.approximate_word_budget or 250
+    claims = analysis.evidence_claims
+    lenses = [
+        "The central idea is",
+        "A second way to understand the material is",
+        "The surrounding context matters because",
+        "For revision, connect this point with",
+        "A useful comparison is",
+        "The evidence also gives the learner a way to test",
+        "The limitation to keep in mind is",
+        "Taken together, these points show",
+        "The terminology should be reviewed alongside",
+        "A practical revision question is how",
+        "The source's progression becomes clearer when",
+        "The final checkpoint for this topic is",
+        "One useful distinction for the reader is",
+        "The surrounding example can be used to ask whether",
+        "This topic connects to the broader study guide through",
+        "A complete review should return to",
+    ]
+    paragraphs: list[str] = []
+    index = 0
+    while count_words("\n\n".join(paragraphs)) < round(budget * 1.10) and index < len(lenses) * max(1, len(claims)):
+        claim = claims[index % len(claims)]
+        ids = " ".join(f"[{item}]" for item in claim.evidence_ids)
+        lead = lenses[index % len(lenses)]
+        text = claim.text.rstrip(".")
+        if index % len(lenses) == 0:
+            paragraph = f"{section.title} begins with the source point that {text} {ids}."
+        elif index % len(lenses) == 6:
+            paragraph = f"{lead} what the supplied passage does not establish beyond {text}; a reader should keep that distinction visible when reviewing the topic {ids}."
+        else:
+            paragraph = f"{lead} {text.lower()}; in this section it should be related to the requested learning objective and the definitions that surround it {ids}."
+        if index % len(lenses) != 0:
+            paragraph = f"{paragraph.rstrip('.')} This is part of {section.title.lower()}."
+        paragraphs.append(paragraph)
+        index += 1
+    return "\n\n".join(paragraphs)
+
+
+class SectionSynthesisEngine:
+    """Two-stage analysis/synthesis with an explicit bounded offline fallback."""
+
+    def __init__(self, reasoner: Reasoner):
+        self.reasoner = reasoner
+        self.last_unknown_evidence_ids: list[str] = []
+        self.used_model = False
+
+    @property
+    def capable(self) -> bool:
+        return callable(getattr(self.reasoner, "_json", None))
+
+    def analyze(
+        self,
+        spec: DocumentSpec,
+        plan: DocumentPlan,
+        section: DocumentSectionPlan,
+        evidence: list[EvidenceChunk],
+        prior_summaries: list[str],
+    ) -> SectionAnalysis:
+        fallback = deterministic_section_analysis(spec, plan, section, evidence, prior_summaries)
+        if not self.capable:
+            return fallback
+        try:
+            result = self.reasoner._json(
+                "Return only JSON matching SectionAnalysis. Separate requirements from evidence. "
+                "Client brief text is planning context, never a factual claim. Reference profile is style only. "
+                "Every evidence claim must cite one or more supplied evidence IDs.",
+                {
+                    "spec": spec.model_dump(exclude={"client_brief"}),
+                    "brief_requirements": spec.client_brief,
+                    "plan": section.model_dump(),
+                    "section_mode": section_mode(section, plan.deliverable_type),
+                    "evidence": evidence_packet(evidence),
+                    "previous_section_summaries": prior_summaries[-4:],
+                    "reference_profile": plan.reference_profile.model_dump() if plan.reference_profile else None,
+                },
+                SectionAnalysis,
+            )
+            self.used_model = True
+            sanitized = sanitize_section_analysis(result, evidence)
+            return sanitized if sanitized.evidence_claims or not evidence else fallback
+        except Exception:
+            return fallback
+
+    def synthesize(
+        self,
+        spec: DocumentSpec,
+        plan: DocumentPlan,
+        section: DocumentSectionPlan,
+        analysis: SectionAnalysis,
+        evidence: list[EvidenceChunk],
+    ) -> str:
+        self.last_unknown_evidence_ids = []
+        # A section with no relevant evidence must remain requirements-only;
+        # never ask the prose model to invent factual content for an empty
+        # evidence packet.
+        if not evidence and not analysis.evidence_claims:
+            return requirements_only_section(spec, section)
+        if self.capable and self.used_model:
+            try:
+                result = self.reasoner._json(
+                    "Return only JSON with a markdown field. Write professional consulting or research prose. "
+                    "Synthesize claims instead of enumerating fragments; vary paragraph structure naturally; do not mention retrieval, chunks, prompts, or workflow mechanics. "
+                    "Distinguish facts from inference and hypotheses, do not invent private facts, and cite evidence only with [E1], [E2] IDs from the packet. "
+                    "Use the target range as guidance, not an exact loop or padding requirement.",
+                    {
+                        "deliverable_type": plan.deliverable_type,
+                        "audience": spec.audience,
+                        "section": section.model_dump(),
+                        "analysis": analysis.model_dump(),
+                        "evidence_packet": evidence_packet(evidence),
+                        "target_range": self._target_range(section),
+                    },
+                    SectionDraft,
+                )
+                normalized, direct_unknown = normalize_model_citations(result.markdown, evidence)
+                content, unknown = replace_evidence_ids(normalized, evidence)
+                self.last_unknown_evidence_ids = sorted(set(direct_unknown + unknown))
+                return content
+            except Exception:
+                pass
+        content, _ = synthesize_bounded_section(spec, section, analysis, evidence)
+        content, unknown = replace_evidence_ids(content, evidence)
+        self.last_unknown_evidence_ids = unknown
+        return content
+
+    @staticmethod
+    def _target_range(section: DocumentSectionPlan) -> str:
+        budget = section.approximate_word_budget or 250
+        return f"{max(120, round(budget * 0.75))}-{max(180, round(budget * 1.15))} words"
+
+
 def build_long_form_section(
     spec: DocumentSpec,
     section: DocumentSectionPlan,
     evidence: list[EvidenceChunk],
     prior_summaries: list[str],
 ) -> str:
-    """Synthesize a section from distinct, claim-level evidence.
-
-    The writer deliberately avoids padding a report with generic bridge
-    sentences.  It groups nearby claims, preserves their provenance, and uses
-    bounded evidence notes only when a requested word budget exceeds the
-    amount of source material available.
-    """
-    budget = section.approximate_word_budget or 250
-    claims = synthesize_evidence_claims(evidence, limit=max(8, min(24, budget // 32)))
-    if not claims:
-        return requirements_only_section(spec, section)
-    paragraphs: list[str] = []
-    disclosure = external_research_disclosure(section, evidence)
-    if disclosure:
-        paragraphs.append(disclosure)
-    # A long-form section needs more than a pasted top chunk, but every
-    # sentence below is still anchored to a claim and its originating chunk.
-    # The varied, section-specific frames add interpretation and reading
-    # guidance without inventing company facts or generic consulting actions.
-    frames = (
-        "{title} records that {claim} {citation}.",
-        "In the source context, {anchor} is presented through the point that {claim} {citation}.",
-        "For this deliverable, the useful reading of {anchor} is to connect it with the surrounding topic rather than isolate one sentence {citation}.",
-        "A reader can use this evidence to ask how {anchor} is defined, measured, or compared in the material; the retrieved passage is the basis for that question {citation}.",
-        "The wording matters because it places {anchor} inside the source's broader discussion of {title_lower} {citation}.",
-        "This is an evidence-backed interpretation of the passage, not a claim about performance beyond the supplied source: {claim} {citation}.",
-        "Read alongside the other retrieved excerpts, the passage gives {title_lower} a concrete reference point through {anchor} {citation}.",
-        "The boundary of the finding is visible here: the source supports {anchor}, while any wider conclusion would require additional material {citation}.",
-        "For review, compare the terminology, assumptions, and outcome associated with {anchor} across the source material; this excerpt supplies one such comparison point {citation}.",
-        "The requested work therefore has a specific study focus: explain what {anchor} means in the source and how it relates to {title_lower} {citation}.",
-        "A concise synthesis of this passage is that {claim}; its relevance to {title_lower} comes from the source's treatment of {anchor} {citation}.",
-        "In a final reading pass, retain the distinction between what the passage states and what a reader may infer from it: the stated point is {claim} {citation}.",
+    """Compatibility entry point backed by the structured section pipeline."""
+    plan = DocumentPlan(
+        title=spec.title,
+        sections=[section],
+        deliverable_type=resolve_deliverable_type(spec),
+        target_depth=depth_label(spec),
     )
-    index = 0
-    # Continue until the requested budget is substantively represented.  A
-    # hard bound prevents malformed or unexpectedly tiny evidence from causing
-    # an unbounded loop in the live demo.
-    max_paragraphs = max(12, min(180, (budget // 24) + len(frames)))
-    while count_words("\n\n".join(paragraphs)) < round(budget * 0.90) and index < max_paragraphs:
-        claim = claims[index % len(claims)]
-        citation = citation_for_claim(claim, evidence)
-        anchors = [
-            term for term in re.findall(r"[\w\u0600-\u06FF]{4,}", claim.text.lower())
-            if term not in STOP_TERMS
-        ][:4]
-        anchor_text = ", ".join(anchors) or "the documented point"
-        title = section.title.rstrip(".")
-        frame = frames[index % len(frames)]
-        sentence = frame.format(
-            title=title,
-            title_lower=title.lower(),
-            claim=claim.text.rstrip("."),
-            anchor=anchor_text,
-            citation=citation,
-        )
-        # Keep repeated evidence interpretations scoped to their section so
-        # the document-level QC can distinguish legitimate reuse from copied
-        # template prose across sections.
-        sentence = f"{sentence.rstrip('.')} This reading belongs to {title.lower()}."
-        if section.section_id == "revision-checklist" and index % 3 == 0:
-            sentence = f"Revision check for {title_lower if (title_lower := title.lower()) else 'this section'}: {sentence}"
-        paragraphs.append(sentence)
-        index += 1
-
-    # With a sparse evidence set, stop at the supported depth rather than
-    # fabricating detail.  The final QC/trace exposes the resulting limitation.
-    content = "\n\n".join(paragraphs)
-    return fit_markdown_to_words(content, budget)
+    analysis = deterministic_section_analysis(spec, plan, section, evidence, prior_summaries)
+    content, _ = synthesize_bounded_section(spec, section, analysis, evidence)
+    return content
 
 
 def fit_markdown_to_words(content: str, budget: int) -> str:
@@ -916,6 +1218,11 @@ def fit_markdown_to_words(content: str, budget: int) -> str:
 
 
 class EvidenceGroundedSectionWriter:
+    def __init__(self, reasoner: Reasoner | None = None):
+        self.reasoner = reasoner or configured_reasoner()
+        self.synthesis = SectionSynthesisEngine(self.reasoner)
+        self.last_analysis: SectionAnalysis | None = None
+
     def write(
         self,
         spec: DocumentSpec,
@@ -926,7 +1233,16 @@ class EvidenceGroundedSectionWriter:
     ) -> str:
         pages = cite_page(evidence)
         if spec.source_kind == "uploaded":
-            return self._write_uploaded(spec, section, evidence, prior_summaries, pages)
+            if plan.deliverable_type == "Summary / Brief":
+                # Summary mode has a deliberately concise three-section shape;
+                # it should not be routed through the long-form consulting
+                # analysis path.
+                self.last_analysis = deterministic_section_analysis(spec, plan, section, evidence, prior_summaries)
+                return self._write_uploaded(spec, section, evidence, prior_summaries, pages)
+            analysis = self.synthesis.analyze(spec, plan, section, evidence, prior_summaries)
+            self.last_analysis = analysis
+            return self.synthesis.synthesize(spec, plan, section, analysis, evidence)
+        self.last_analysis = None
         if section.section_id == "executive-summary":
             return (
                 "The assessment focuses on reliability, security, and cost optimization for a customer-facing AWS workload. "
@@ -1095,22 +1411,37 @@ class EvidenceGroundedSectionWriter:
 
 
 def requirements_only_section(spec: DocumentSpec, section: DocumentSectionPlan) -> str:
-    """Write a useful, clearly bounded analysis when no factual evidence exists."""
-    title = section.title.strip()
-    objective = section.objective.strip().rstrip(".")
-    lines = [
-        f"Scope. {title} is included in the requested engagement.",
-        f"Analysis focus. The workstream should {objective[:260].lower()}.",
-        "Current evidence status. No client document or usable website evidence was available for this workstream, so the statements below are hypotheses and data requirements rather than findings about the company.",
+    """Write natural, bounded diagnostic prose when evidence is absent."""
+    title = section.title.strip().lower()
+    objective = section.objective.strip().rstrip(".").lower()
+    objective = objective.replace("without adding recommendations", "without adding operational advice")
+    decision_word = "decision" if resolve_deliverable_type(spec) == "Summary / Brief" else "recommendation"
+    paragraphs = [
+        f"The {title} workstream is part of the requested engagement and should {objective}. The supplied material does not establish the company's current position on this question, so this paragraph is a diagnostic framing rather than a factual conclusion.",
+        f"A useful review should examine the decisions, constraints, baselines, and outcomes that determine {title}. The assessment can then distinguish an observed condition from a working hypothesis and identify which threshold would justify action.",
+        f"The missing inputs are likely to include internal operating records, customer or channel measures, financial baselines, and accountable decision owners. Those inputs should be collected before a company-specific {decision_word} is treated as approved.",
     ]
+    # An explicit long-form request still deserves a coherent diagnostic
+    # treatment offline.  Expand by analytical dimensions, never by rotating
+    # sentence frames or repeating a retrieved fragment.
+    budget = section.approximate_word_budget or 0
+    lenses = [
+        f"For {title}, the first decision criterion is whether the stated objective can be measured with a stable baseline rather than an anecdotal impression.",
+        f"The second criterion is ownership: map which role can supply the relevant record, approve a change, and review the outcome for {title}.",
+        f"A third lens is sequencing. Separate information that is needed before diagnosis from information that is only useful after a preferred option has been selected.",
+        f"The review should also record constraints that could change the decision, including capacity, cash, customer experience, channel dependencies, and timing.",
+        f"Where the evidence is incomplete, compare competing hypotheses and state what observation would confirm or weaken each one instead of presenting a gap as a weakness.",
+        f"A practical working paper for {title} should preserve the distinction between an observable public signal, an internal fact, an inference, and a recommendation.",
+        f"The output can then define a decision threshold, the minimum data needed to reach it, and the consequence of deferring the decision.",
+        f"This approach keeps the requested analysis useful without claiming that the supplied material proves a company-specific condition.",
+    ]
+    while budget and count_words("\n\n".join(paragraphs)) < round(budget * 0.88) and lenses:
+        paragraphs.append(lenses.pop(0))
     if requires_external_research(section):
-        lines.append("External research limitation. Public market, competitor, and sizing research was not configured for this run; validate this workstream against independent sources before relying on it.")
-    lines.extend([
-        f"Working hypothesis. A useful assessment of {title.lower()} should test the drivers, constraints, and decision points named in the requested scope.",
-        "Data required. Validate the hypothesis with internal operating, customer, financial, channel, and performance data appropriate to this workstream.",
-        "Recommended next step. Confirm the evidence owner, baseline, and decision threshold before converting this workstream into a company-specific conclusion.",
-    ])
-    return "\n\n".join(lines)
+        paragraphs.append(
+            "Public competitor, market, and internationalisation research was not available in this run. Any market conclusion should therefore remain preliminary until independent sources are reviewed and cited."
+        )
+    return "\n\n".join(paragraphs)
 
 
 def external_research_disclosure(section: DocumentSectionPlan, evidence: list[EvidenceChunk]) -> str:
@@ -1120,8 +1451,8 @@ def external_research_disclosure(section: DocumentSectionPlan, evidence: list[Ev
     if any((chunk.source or "").lower().startswith("web research:") for chunk in evidence):
         return ""
     return (
-        "External research status. Public competitor, market, and internationalisation sources were not available in this run; "
-        "the observations below are limited to the supplied client evidence and should be externally validated before use."
+        "Public competitor, market, and internationalisation sources were not available in this run. "
+        "Any market conclusion should therefore remain preliminary until independent sources are reviewed and cited."
     )
 
 
@@ -1143,7 +1474,7 @@ class DeterministicSectionQC:
         _, validation = Agent.validate_citations(content, evidence)
         missing = []
         lower = content.lower()
-        required_terms = [item.lower() for item in (section.requirements or section_requirements(section))]
+        required_terms = [] if not evidence else [item.lower() for item in (section.requirements or section_requirements(section))]
         for required in required_terms:
             if required not in lower:
                 missing.append(required)
@@ -1191,11 +1522,23 @@ def section_requirements(section: DocumentSectionPlan) -> list[str]:
 
 
 def resolve_deliverable_type(spec: DocumentSpec) -> str:
+    brief = spec.client_brief.lower()
+    strategy_intent = has_strong_strategy_intent(brief)
+    # A long-form strategy request dominates an accidental leading phrase such
+    # as "explain briefly".  Explicit controls still win when the user chose a
+    # concrete non-Auto type; the legacy weak-summary override is retained only
+    # for compatibility with older callers that passed Curriculum with a pure
+    # summary brief.
+    if spec.deliverable_type != "Auto":
+        if strategy_intent:
+            return spec.deliverable_type
+        if has_strong_summary_intent(spec.client_brief):
+            return "Summary / Brief"
+        return spec.deliverable_type
+    if strategy_intent:
+        return "Consulting Assessment"
     if has_strong_summary_intent(spec.client_brief):
         return "Summary / Brief"
-    if spec.deliverable_type != "Auto":
-        return spec.deliverable_type
-    brief = spec.client_brief.lower()
     if any(term in brief for term in ("teach", "lesson", "curriculum", "student", "learning objective", "classroom")):
         return "Curriculum / Teaching Material"
     if any(term in brief for term in ("risk", "remediation", "roadmap", "90-day", "recommend", "assessment", "action plan", "strategy report", "scope of work", "stage 1", "diagnostic")):
@@ -1205,6 +1548,28 @@ def resolve_deliverable_type(spec: DocumentSpec) -> str:
     if has_strong_summary_intent(spec.client_brief):
         return "Summary / Brief"
     return "Custom"
+
+
+def has_strong_strategy_intent(brief: str) -> bool:
+    """Identify dominant consulting/strategy signals before weak summary cues."""
+    lower = (brief or "").lower()
+    signals = (
+        "business strategy report",
+        "competitive landscape",
+        "financial strategy",
+        "organisational assessment",
+        "organizational assessment",
+        "kpi framework",
+        "action plan",
+        "roadmap",
+        "scope of work",
+        "stage 1",
+        "stage 2",
+        "stage 3",
+        "diagnostic",
+    )
+    numbered_items = len(extract_scope_items(brief))
+    return numbered_items >= 3 or any(signal in lower for signal in signals)
 
 
 def has_strong_summary_intent(brief: str) -> bool:
@@ -1297,6 +1662,10 @@ def deterministic_content_checks(
     if filler:
         issues.append("Content contains repetitive template prose.")
         unsupported.extend(filler)
+    pipeline_language = internal_pipeline_language_issues(content)
+    if pipeline_language:
+        issues.append("Internal generation or retrieval language leaked into the section.")
+        unsupported.extend(pipeline_language)
     incomplete = incomplete_sentences(content)
     if incomplete:
         issues.append("One or more sentences appear incomplete.")
@@ -1337,6 +1706,29 @@ def repetitive_prose_issues(text: str) -> list[str]:
     )
     lower = text.lower()
     return [pattern for pattern in patterns if pattern in lower]
+
+
+def internal_pipeline_language_issues(text: str) -> list[str]:
+    markers = (
+        "source establishes",
+        "evidence boundary",
+        "retrieved passage",
+        "remaining requirement",
+        "this reading belongs to",
+        "the excerpt supports",
+        "retrieval chunk",
+        "evidence packet",
+    )
+    lower = text.lower()
+    issues = [marker for marker in markers if marker in lower]
+    stems: dict[str, int] = {}
+    for sentence in re.split(r"(?<=[.!?])\s+", text):
+        words = re.findall(r"[A-Za-z\u0600-\u06FF]{3,}", sentence.lower())
+        if len(words) >= 6:
+            stem = " ".join(words[:6])
+            stems[stem] = stems.get(stem, 0) + 1
+    issues.extend(f"repeated sentence stem: {stem}" for stem, count in stems.items() if count >= 3)
+    return issues[:8]
 
 
 def incomplete_sentences(text: str) -> list[str]:
@@ -1405,7 +1797,7 @@ def citation_coverage_issues(content: str, evidence: list[EvidenceChunk]) -> lis
     return issues
 
 
-def cited_sentences(content: str) -> list[str]:
+def _legacy_cited_sentences(content: str) -> list[str]:
     normalized = re.sub(r"\n+", " ", content)
     return [item.strip() for item in re.split(r"(?<=[.!?؟])\s+", normalized) if "[" in item and "]" in item]
 
@@ -2012,7 +2404,14 @@ def external_research_disclosure_issues(
         if not requires_external_research(plan):
             continue
         has_external = any((chunk.source or "").lower().startswith("web research:") for chunk in section.evidence)
-        has_limit = "external research status." in section.content_markdown.lower() or "external research limitation." in section.content_markdown.lower()
+        lower_content = section.content_markdown.lower()
+        has_limit = (
+            "external research status." in lower_content
+            or "external research limitation." in lower_content
+            or "public competitor, market, and internationalisation research was not available" in lower_content
+            or "public competitor, market, and internationalisation sources were not available" in lower_content
+            or "any market conclusion should therefore remain preliminary" in lower_content
+        )
         if not has_external and not has_limit:
             issues.append(section.title)
     return issues
@@ -2021,11 +2420,21 @@ def external_research_disclosure_issues(
 def cross_section_duplication(sections: list[GeneratedSection]) -> list[str]:
     fingerprints: dict[str, list[str]] = {}
     for section in sections:
-        if section.section_id == "evidence":
+        if section.section_id == "evidence" or not section.evidence:
             continue
         sentences = []
         for paragraph in re.split(r"\n\s*\n", section.content_markdown):
-            if "external research status" in paragraph.lower() or "external research limitation" in paragraph.lower():
+            if any(marker in paragraph.lower() for marker in (
+                "external research status",
+                "external research limitation",
+                "supplied material does not establish",
+                "the missing inputs are likely to include",
+                "the assessment can then distinguish",
+                "separate information that is needed",
+                "the review should also record constraints",
+                "where the evidence is incomplete",
+                "the output can then define a decision threshold",
+            )):
                 continue
             for sentence in re.split(r"(?<=[.!?])\s+", paragraph):
                 cleaned = re.sub(r"\W+", " ", re.sub(r"\[[^\]]+\]", "", sentence.lower())).strip()

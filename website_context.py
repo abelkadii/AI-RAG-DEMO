@@ -104,6 +104,17 @@ def _extract_text(raw: str) -> str:
     cleaned = re.sub(r"(?is)<(script|style|noscript|svg).*?</\1>", " ", raw)
     cleaned = re.sub(r"<[^>]+>", " ", cleaned)
     cleaned = html.unescape(cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    # Strip storefront chrome that is navigation state rather than company
+    # evidence, while retaining product, category, proposition, and fulfilment
+    # text for retrieval.
+    noise = re.compile(
+        r"(?:accept\s+decline|your\s+cart\s+is\s+empty|continue\s+shopping|go\s+to\s+item\s+\d+|"
+        r"refer\s+to\s+our\s+privacy\s+policy|close\s+menu|skip\s+to\s+content)",
+        flags=re.I,
+    )
+    sentences = [sentence.strip() for sentence in re.split(r"(?<=[.!?])\s+", cleaned) if sentence.strip()]
+    cleaned = " ".join(sentence for sentence in sentences if not noise.search(sentence))
     return re.sub(r"\s+", " ", cleaned).strip()
 
 

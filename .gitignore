@@ -13,5 +13,6 @@ data/*.pdf
 traces/
 .streamlit/secrets.toml
 output/
+.tmp/
 streamlit-startup*.log
 streamlit-*.log

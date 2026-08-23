@@ -49,7 +49,7 @@ def docx_bytes(trace: DocumentTrace) -> bytes:
             continue
         document.add_heading(section_trace.title, level=1)
         for block in section_trace.content_markdown.splitlines():
-            text = block.strip()
+            text = strip_markdown_inline(block.strip())
             if not text:
                 continue
             if text.startswith("- "):
@@ -123,7 +123,10 @@ def _monochrome_pdf_bytes(trace: DocumentTrace) -> bytes:
     cover.insert_text((margin, 205), "Evidence-grounded strategy deliverable", fontsize=12, fontname="hebo", color=(0.25, 0.25, 0.25))
     cover.insert_text((margin, 260), f"Audience: {trace.spec.audience}", fontsize=10, fontname="helv", color=(0.2, 0.2, 0.2))
     cover.insert_text((margin, 280), f"Reference precedent: {', '.join(trace.spec.reference_source_names) if trace.spec.reference_source_names else 'None'}", fontsize=10, fontname="helv", color=(0.2, 0.2, 0.2))
-    cover.insert_text((margin, 300), f"Client sources: {', '.join(trace.spec.client_source_names) if trace.spec.client_source_names else 'Client brief'}", fontsize=10, fontname="helv", color=(0.2, 0.2, 0.2))
+    client_sources = ", ".join(trace.spec.client_source_names) if trace.spec.client_source_names else (
+        "No client PDFs; website/public evidence only" if trace.spec.source_kind == "uploaded" else "AWS sample corpus"
+    )
+    cover.insert_text((margin, 300), f"Client sources: {client_sources}", fontsize=10, fontname="helv", color=(0.2, 0.2, 0.2))
     if trace.spec.company_website:
         cover.insert_text((margin, 320), f"Website context: {trace.spec.company_website}", fontsize=10, fontname="helv", color=(0.2, 0.2, 0.2))
     cover.insert_textbox(pymupdf.Rect(margin, 680, page_width - margin, 735), "Prepared from selected client evidence and explicitly stated requirements. Reference documents inform structure and presentation only.", fontsize=9, fontname="helv", color=(0.25, 0.25, 0.25))
@@ -143,6 +146,7 @@ def _monochrome_pdf_bytes(trace: DocumentTrace) -> bytes:
             size = 9.5
             if text.startswith("- "):
                 text = "- " + text[2:]
+        text = strip_markdown_inline(text)
         wrapped = textwrap.wrap(text, width=92) or [""]
         line_height = max(15, size * 1.55)
         if y + line_height * len(wrapped) > page_height - 55:
@@ -160,3 +164,8 @@ def _monochrome_pdf_bytes(trace: DocumentTrace) -> bytes:
 def re_numbered(text: str) -> bool:
     prefix = text.split(" ", 1)[0]
     return prefix.endswith(".") and prefix[:-1].isdigit()
+
+
+def strip_markdown_inline(text: str) -> str:
+    """Keep lightweight exports readable without exposing Markdown markers."""
+    return re.sub(r"\*\*(.+?)\*\*", r"\1", text)

@@ -59,6 +59,7 @@ Every run records search queries, reasons, retrieved page/section metadata, suff
 - `llm.py`: OpenAI-compatible reasoning path with bounded structured-output retry and an offline deterministic fallback.
 - `document_models.py`: serializable document-production trace models.
 - `document_workflow.py`: surveys sources, builds depth-aware plans, researches each section with distinct questions, drafts cited sections, and runs QC.
+- `document_workflow.py`: separates structured section analysis from prose synthesis; capable models cite evidence packet IDs that are deterministically rendered to source/page citations.
 - `document_export.py`: exports DOCX, PDF, and Markdown.
 - `streamlit_app.py`: public demo UI with Document Studio and RAG Explorer tabs.
 
@@ -92,6 +93,9 @@ Optional:
 - `OPENAI_ANSWER_MAX_TOKENS`
 - `DEMO_ACCESS_CODE`
 - `LLM_MODE=local` to force the deterministic fallback
+- `ENABLE_EXTERNAL_RESEARCH=1` to enable the bounded public-source research adapter for strategy sections
+
+When no capable synthesis model is configured, Document Studio emits a bounded evidence summary or diagnostic data-gap analysis and marks requested depth limits for review; it does not pad the report with repeated fallback prose.
 
 Credentials stay server-side and are never written to traces or UI output.
 

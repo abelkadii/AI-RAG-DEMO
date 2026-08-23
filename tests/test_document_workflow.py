@@ -16,12 +16,13 @@ from document_workflow import (
     source_topic_labels,
     build_long_form_section,
     cited_sentences,
+    replace_evidence_ids,
 )
 from llm import LocalReasoner
 from models import AgentTrace, EvidenceChunk
 from uploaded_corpus import clean_uploaded_text, diversify_results, extract_pdf_bytes
 from website_context import fetch_website_evidence
-from streamlit_app import MAX_BRIEF_LENGTH
+from streamlit_app import MAX_BRIEF_LENGTH, default_client_brief
 
 
 class DocumentFakeRetriever:
@@ -192,6 +193,15 @@ def test_auto_classifies_research_and_consulting_briefs_differently():
     assert resolve_deliverable_type(consulting) == "Consulting Assessment"
 
 
+def test_strong_strategy_intent_overrides_accidental_briefly_prefix_in_auto_mode():
+    spec = DocumentSpec(
+        client_brief="what does this talk about, explain briefly. Create a new business strategy report with Stage 1, Stage 2 and Stage 3, including a roadmap and KPI framework.",
+        source_kind="uploaded",
+        deliverable_type="Auto",
+    )
+    assert resolve_deliverable_type(spec) == "Consulting Assessment"
+
+
 def test_summary_brief_overrides_mismatched_manual_curriculum_type():
     spec = DocumentSpec(
         client_brief="what does this talk about, explain briefly in 400 words",
@@ -304,6 +314,13 @@ def test_long_brief_survives_document_spec_without_truncation():
     assert spec.client_brief == brief
     assert len(spec.client_brief) == len(brief)
     assert MAX_BRIEF_LENGTH >= 40000
+
+
+def test_uploaded_workflow_brief_starts_empty_and_does_not_prefix_strategy_scope():
+    strategy_scope = "Create a new business strategy report. Stage 1 - Diagnostic. Stage 2 - Planning. Stage 3 - Training."
+    assert default_client_brief("Upload documents") == ""
+    assert strategy_scope == strategy_scope.strip()
+    assert not strategy_scope.startswith("what does this talk about")
 
 
 def test_website_context_rejects_unbounded_or_insecure_urls_gracefully():
@@ -439,6 +456,25 @@ def test_long_form_writer_avoids_known_filler_templates():
     assert "this gives the reader a grounded way" not in content.lower()
     assert "taken with the other retrieved passages" not in content.lower()
     assert "this section addresses" not in content.lower()
+
+
+def test_document_section_filter_does_not_inject_irrelevant_sparse_evidence():
+    section = DocumentSectionPlan(
+        section_id="market",
+        title="Market Analysis",
+        objective="Assess customer segments and market sizing.",
+        requirements=["market"],
+    )
+    unrelated = [EvidenceChunk(chunk_id="unrelated", page=2, source="client.pdf", text="A private office seating arrangement and internal staff roster.", score=0.95)]
+    assert filter_section_evidence(section, unrelated, requested_k=6) == []
+
+
+def test_evidence_ids_are_replaced_deterministically_and_unknown_ids_rejected():
+    evidence = [EvidenceChunk(chunk_id="one", page=12, source="Strategy_Report.pdf", text="A supported finding about the operating model.")]
+    cleaned, unknown = replace_evidence_ids("A supported finding [E1]. Another claim [E9].", evidence)
+    assert "[Strategy_Report.pdf p.12]" in cleaned
+    assert "[E9]" not in cleaned
+    assert unknown == ["E9"]
 
 
 def test_citation_sentence_split_does_not_break_pdf_filename():

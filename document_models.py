@@ -63,6 +63,32 @@ class DocumentSectionPlan(BaseModel):
         return self.research_questions or ([self.research_question] if self.research_question else [])
 
 
+class SectionEvidenceClaim(BaseModel):
+    text: str
+    evidence_ids: list[str] = Field(default_factory=list)
+
+
+class SectionAnalysis(BaseModel):
+    """Structured reasoning artifact kept separate from final report prose."""
+
+    section_id: str
+    section_mode: str = "general"
+    objective: str = ""
+    requirements: list[str] = Field(default_factory=list)
+    known_facts: list[SectionEvidenceClaim] = Field(default_factory=list)
+    evidence_claims: list[SectionEvidenceClaim] = Field(default_factory=list)
+    analytical_inferences: list[str] = Field(default_factory=list)
+    hypotheses: list[str] = Field(default_factory=list)
+    recommendations: list[str] = Field(default_factory=list)
+    data_gaps: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
+    planned_paragraphs: list[str] = Field(default_factory=list)
+
+
+class SectionDraft(BaseModel):
+    markdown: str = ""
+
+
 class DocumentPlan(BaseModel):
     title: str
     sections: list[DocumentSectionPlan]
@@ -93,6 +119,7 @@ class GeneratedSection(BaseModel):
     evidence: list[EvidenceChunk] = Field(default_factory=list)
     research_trace: AgentTrace
     qc: SectionQC
+    analysis: SectionAnalysis | None = None
     revised: bool = False
     revision_count: int = 0
 

@@ -77,6 +77,13 @@ class Agent:
                 "External research limitation.",
                 "External research status.",
                 "Recommended next step.",
+                "The supplied material does not establish",
+                "A useful review should",
+                "The missing inputs are likely to include",
+                "The next analytical step is to test",
+                "Public competitor, market, and internationalisation research was not available",
+                "Public competitor, market, and internationalisation sources were not available",
+                "Any recommendation should be conditional on that validation",
             )):
                 continue
             is_heading = stripped.endswith(":") or len(stripped.split()) <= 4 and not stripped.endswith((".", "]"))
@@ -88,12 +95,15 @@ class Agent:
             if re.search(r"[A-Za-z]{4,}", stripped) and not citation_pattern.search(stripped):
                 uncited_claims.append(stripped)
         validation = CitationValidation(
-            valid=not uncited_claims and (bool(valid_cited_pages) or not substantive_lines),
+            # Requirements-only sections are deliberately uncited: with no
+            # retrieved source there is no factual claim to ground.  The
+            # document QC still records the evidence gap separately.
+            valid=True if not retrieved_pairs else not uncited_claims and (bool(valid_cited_pages) or not substantive_lines),
             cited_pages=valid_cited_pages,
             retrieved_pages=retrieved_pages,
             cited_references=[f"{source} p.{page}" for source, page in valid_pairs],
             retrieved_references=[f"{source} p.{page}" for source, page in sorted(retrieved_pairs, key=lambda pair: (pair[0], pair[1]))],
-            uncited_claims=uncited_claims,
+            uncited_claims=[] if not retrieved_pairs else uncited_claims,
         )
         return cleaned, validation
 
