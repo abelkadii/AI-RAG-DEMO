@@ -16,9 +16,8 @@ from document_workflow import (
     DEFAULT_BRIEF,
     DEPTH_PROFILES,
     DocumentWorkflow,
-    curriculum_strategy_mismatch,
-    effective_deliverable_type,
     explicit_word_count,
+    resolve_deliverable_type,
 )
 from llm import configured_reasoner
 from models import AgentTrace, EvidenceChunk, IterationTrace
@@ -462,8 +461,14 @@ def document_studio() -> None:
                     index=1,
                     help="Depth controls length independently of deliverable type.",
                 )
-            effective_type_preview = effective_deliverable_type(deliverable_type, brief)
-            if curriculum_strategy_mismatch(brief, deliverable_type):
+            effective_type_preview = resolve_deliverable_type(
+                DocumentSpec(
+                    client_brief=brief,
+                    source_kind="uploaded",
+                    deliverable_type=deliverable_type,
+                )
+            )
+            if deliverable_type == "Curriculum / Teaching Material" and effective_type_preview == "Consulting Assessment":
                 st.warning(
                     "The brief strongly indicates a Consulting Assessment, but Curriculum / Teaching Material is selected. "
                     "The run will use Consulting Assessment to prevent an incompatible plan."
