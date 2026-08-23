@@ -1,4 +1,5 @@
 from agent import Agent
+from document_models import SectionAnalysis
 from llm import LocalReasoner, OpenAIReasoner, configured_reasoner
 from models import AgentState, EvidenceChunk, EvidenceAssessment, SearchDecision
 
@@ -208,6 +209,26 @@ def test_structured_model_output_retries_after_malformed_json():
     reasoner.client = FakeClient(["not json", '{"search_query":"AWS reliability","reason":"Need evidence."}'])
     result = reasoner._json("system", {"question": "q"}, SearchDecision)
     assert result.search_query == "AWS reliability"
+
+
+def test_openai_section_analysis_normalizes_shape_variants_without_retry():
+    reasoner = OpenAIReasoner.__new__(OpenAIReasoner)
+    reasoner.model = "fake"
+    reasoner.max_json_tokens = 500
+    reasoner.client = FakeClient([
+        '{"section_id":"executive-summary","requirements":[{"id":"R1","requirement":"Assess organisational health"}],'
+        '"known_facts":["A public rating is shown. [E1]"],"evidence_claims":[{"claim":"A roadmap is described.","source_ids":["E2"]}]}'
+    ])
+
+    result = reasoner._json("system", {}, SectionAnalysis, max_attempts=2)
+
+    assert result.known_facts[0].text == "A public rating is shown."
+    assert result.known_facts[0].evidence_ids == ["E1"]
+    assert result.evidence_claims[0].text == "A roadmap is described."
+    assert result.evidence_claims[0].evidence_ids == ["E2"]
+    assert result.requirements == ["Assess organisational health"]
+    assert reasoner.last_structured_normalized is True
+    assert reasoner.last_structured_repair_retry is False
 
 
 def test_openai_assessment_falls_back_after_empty_structured_output():

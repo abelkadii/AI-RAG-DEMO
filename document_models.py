@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import re
 from typing import Literal
 
 from pydantic import AliasChoices, BaseModel, Field, field_validator
@@ -71,6 +72,84 @@ class SectionEvidenceClaim(BaseModel):
     )
 
 
+_EVIDENCE_TOKEN_RE = re.compile(r"\[(E\d+)\]", flags=re.IGNORECASE)
+
+
+def _clean_claim_text(value: object) -> tuple[str, list[str]]:
+    text = str(value or "")
+    ids = [match.upper() for match in _EVIDENCE_TOKEN_RE.findall(text)]
+    cleaned = _EVIDENCE_TOKEN_RE.sub("", text)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned, ids
+
+
+def _normalize_claim_items(value: object) -> list[dict[str, object]]:
+    """Coerce compact or verbose model claims into the canonical claim shape."""
+    if value is None:
+        return []
+    items = value if isinstance(value, list) else [value]
+    normalized: list[dict[str, object]] = []
+    for item in items:
+        if isinstance(item, SectionEvidenceClaim):
+            normalized.append(item.model_dump())
+            continue
+        if isinstance(item, str):
+            text, ids = _clean_claim_text(item)
+            normalized.append({"text": text, "evidence_ids": ids})
+            continue
+        if not isinstance(item, dict):
+            continue
+        raw_text = next(
+            (item.get(key) for key in ("text", "claim", "statement", "fact", "finding") if item.get(key)),
+            "",
+        )
+        text, ids = _clean_claim_text(raw_text)
+        explicit_ids = item.get("evidence_ids") or item.get("source_ids") or item.get("supporting_evidence_ids") or []
+        if isinstance(explicit_ids, str):
+            explicit_ids = _EVIDENCE_TOKEN_RE.findall(explicit_ids) or [explicit_ids]
+        ids = sorted({*ids, *(str(value).upper() for value in explicit_ids if value)})
+        normalized.append({"text": text, "evidence_ids": ids})
+    return normalized
+
+
+def _normalize_requirements(value: object) -> list[str]:
+    if value is None:
+        return []
+    items = value if isinstance(value, list) else [value]
+    normalized: list[str] = []
+    for item in items:
+        if isinstance(item, str):
+            if item.strip():
+                normalized.append(item.strip())
+            continue
+        if isinstance(item, dict):
+            text = next(
+                (item.get(key) for key in ("requirement", "text", "description", "objective", "title") if item.get(key)),
+                None,
+            )
+            if text is not None and str(text).strip():
+                normalized.append(str(text).strip())
+    return normalized
+
+
+def normalize_section_analysis_payload(payload: object) -> tuple[object, bool]:
+    """Normalize known model shape variants before Pydantic validation."""
+    if not isinstance(payload, dict):
+        return payload, False
+    normalized = dict(payload)
+    changed = False
+    for field in ("known_facts", "evidence_claims"):
+        if field in normalized:
+            value = _normalize_claim_items(normalized[field])
+            changed = changed or value != normalized[field]
+            normalized[field] = value
+    if "requirements" in normalized:
+        value = _normalize_requirements(normalized["requirements"])
+        changed = changed or value != normalized["requirements"]
+        normalized["requirements"] = value
+    return normalized, changed
+
+
 class SectionAnalysis(BaseModel):
     """Structured reasoning artifact kept separate from final report prose."""
 
@@ -88,6 +167,16 @@ class SectionAnalysis(BaseModel):
     recommended_analysis: list[str] = Field(default_factory=list)
     evidence_ids: list[str] = Field(default_factory=list)
     planned_paragraphs: list[str] = Field(default_factory=list)
+
+    @field_validator("requirements", mode="before")
+    @classmethod
+    def normalize_requirements(cls, value):
+        return _normalize_requirements(value)
+
+    @field_validator("known_facts", "evidence_claims", mode="before")
+    @classmethod
+    def normalize_claims(cls, value):
+        return _normalize_claim_items(value)
 
     @field_validator(
         "analytical_inferences",
@@ -168,6 +257,9 @@ class GeneratedSection(BaseModel):
     qc: SectionQC
     analysis: SectionAnalysis | None = None
     analysis_model_used: bool = False
+    analysis_error: str | None = None
+    analysis_normalized: bool = False
+    analysis_repair_retry: bool = False
     synthesis_model_used: bool = False
     synthesis_error: str | None = None
     synthesis_fallback: bool = False

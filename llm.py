@@ -24,6 +24,7 @@ class OpenAIReasoner:
 
         self.model = os.getenv("OPENAI_CHAT_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
         self.selection_reason = "OPENAI_API_KEY configured and LLM_MODE permits OpenAIReasoner."
+        self.section_analysis_max_attempts = 2
         self.max_json_tokens = int(os.getenv("OPENAI_JSON_MAX_TOKENS", "900"))
         self.max_answer_tokens = int(os.getenv("OPENAI_ANSWER_MAX_TOKENS", "900"))
         self.client = OpenAI(
@@ -41,9 +42,11 @@ class OpenAIReasoner:
             return {}
         return {"temperature": 0}
 
-    def _json(self, system: str, payload: dict, schema: type):
+    def _json(self, system: str, payload: dict, schema: type, *, max_attempts: int = 3):
         last_error: Exception | None = None
-        for attempt in range(3):
+        self.last_structured_normalized = False
+        self.last_structured_repair_retry = False
+        for attempt in range(max(1, max_attempts)):
             try:
                 token_limit = getattr(self, "max_json_tokens", 900)
                 if self.model.startswith("gpt-5"):
@@ -61,14 +64,23 @@ class OpenAIReasoner:
                 content = response.choices[0].message.content or ""
                 if not content.strip():
                     raise ValueError("Model returned empty structured output")
-                return schema.model_validate_json(content)
+                raw_payload = json.loads(content)
+                if schema.__name__ == "SectionAnalysis":
+                    # Imported lazily to avoid a module cycle during startup.
+                    from document_models import normalize_section_analysis_payload
+
+                    raw_payload, normalized = normalize_section_analysis_payload(raw_payload)
+                    self.last_structured_normalized = self.last_structured_normalized or normalized
+                return schema.model_validate(raw_payload)
             except (ValidationError, json.JSONDecodeError, ValueError, TypeError, KeyError, IndexError) as error:
                 last_error = error
-                system = (
-                    system
-                    + " Return only valid JSON matching the requested schema. "
-                    + f"This is retry {attempt + 1}."
-                )
+                if attempt + 1 < max_attempts:
+                    self.last_structured_repair_retry = True
+                    system = (
+                        system
+                        + " Return only valid JSON matching the requested schema. "
+                        + f"This is repair retry {attempt + 1}."
+                    )
             except Exception as error:
                 raise RuntimeError(f"Model request failed: {error}") from error
         raise RuntimeError(f"Model returned malformed structured output after retry: {last_error}") from last_error

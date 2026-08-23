@@ -641,19 +641,23 @@ class DocumentWorkflow:
                 qc=qc,
                 analysis=getattr(self.section_writer, "last_analysis", None),
                 analysis_model_used=getattr(getattr(self.section_writer, "synthesis", None), "last_analysis_model_used", False),
+                analysis_error=getattr(getattr(self.section_writer, "synthesis", None), "last_analysis_error", None),
+                analysis_normalized=getattr(getattr(self.section_writer, "synthesis", None), "last_analysis_normalized", False),
+                analysis_repair_retry=getattr(getattr(self.section_writer, "synthesis", None), "last_analysis_repair_retry", False),
                 synthesis_model_used=getattr(getattr(self.section_writer, "synthesis", None), "last_synthesis_model_used", False),
-                synthesis_error=(
-                    getattr(getattr(self.section_writer, "synthesis", None), "last_synthesis_error", None)
-                    or getattr(getattr(self.section_writer, "synthesis", None), "last_analysis_error", None)
-                ),
+                synthesis_error=getattr(getattr(self.section_writer, "synthesis", None), "last_synthesis_error", None),
                 synthesis_fallback=getattr(getattr(self.section_writer, "synthesis", None), "last_used_fallback", False),
                 revised=revised,
                 revision_count=revision_count,
             )
             generated_sections.append(generated)
             prior_summaries.append(summarize_section(content))
+            if generated.analysis_normalized:
+                self._event(on_event, "Structured analysis normalized locally")
+            if generated.analysis_repair_retry:
+                self._event(on_event, "Structured analysis repair retry")
             if generated.synthesis_error:
-                self._event(on_event, f"Synthesis fallback for {section_plan.title}: {generated.synthesis_error}")
+                self._event(on_event, f"Synthesis fallback for {section_plan.title} - structured model output could not be validated.")
             self._event(on_event, f"{section_plan.title} approved" if qc.passed else f"{section_plan.title} needs review")
 
         all_evidence = list(evidence_by_id.values())
@@ -1173,6 +1177,8 @@ class SectionSynthesisEngine:
         self.reasoner = reasoner
         self.last_unknown_evidence_ids: list[str] = []
         self.last_analysis_model_used = False
+        self.last_analysis_normalized = False
+        self.last_analysis_repair_retry = False
         self.last_synthesis_model_used = False
         self.last_analysis_error: str | None = None
         self.last_synthesis_error: str | None = None
@@ -1198,14 +1204,30 @@ class SectionSynthesisEngine:
             self.last_used_fallback = True
             return fallback
         try:
-            result = self.reasoner._json(
-                "Return only JSON matching SectionAnalysis. Separate requirements from evidence. "
+            analysis_prompt = (
+                "Return only JSON matching this exact SectionAnalysis shape: "
+                "{section_id, section_mode, objective, requirements: [string], "
+                "known_facts: [{text, evidence_ids: [string]}], "
+                "evidence_claims: [{text, evidence_ids: [string]}], "
+                "analytical_inferences: [string], hypotheses: [string], recommendations: [string], "
+                "data_gaps: [string], observable_context: [string], recommended_analysis: [string], "
+                "evidence_ids: [string], planned_paragraphs: [string]}. "
+                "Requirements MUST be strings only. known_facts and evidence_claims MUST be objects. "
+                "Put evidence IDs in evidence_ids arrays, never append citation tokens to text. "
+                "Separate requirements from evidence. "
                 "Client brief text is planning context, never a factual claim. Reference profile is style only. "
                 "Every evidence claim must cite one or more supplied evidence IDs. "
                 "When evidence is empty, known_facts and evidence_claims must be empty; use observable_context, "
                 "analytical_inferences, hypotheses, data_gaps, recommended_analysis, and conditional recommendations "
                 "instead. Never state private company facts, performance, financial numbers, or internal conditions "
-                "that are not present in the evidence packet.",
+                "that are not present in the evidence packet."
+            )
+            json_kwargs = {}
+            analysis_attempts = getattr(self.reasoner, "section_analysis_max_attempts", None)
+            if analysis_attempts:
+                json_kwargs["max_attempts"] = analysis_attempts
+            result = self.reasoner._json(
+                analysis_prompt,
                 {
                     "spec": spec.model_dump(exclude={"client_brief"}),
                     "brief_requirements": spec.client_brief,
@@ -1216,7 +1238,10 @@ class SectionSynthesisEngine:
                     "reference_profile": plan.reference_profile.model_dump() if plan.reference_profile else None,
                 },
                 SectionAnalysis,
+                **json_kwargs,
             )
+            self.last_analysis_normalized = bool(getattr(self.reasoner, "last_structured_normalized", False))
+            self.last_analysis_repair_retry = bool(getattr(self.reasoner, "last_structured_repair_retry", False))
             self.last_analysis_model_used = True
             sanitized = sanitize_section_analysis(result, evidence)
             return sanitized
@@ -1325,6 +1350,8 @@ class EvidenceGroundedSectionWriter:
                 # it should not be routed through the long-form consulting
                 # analysis path.
                 self.synthesis.last_analysis_model_used = False
+                self.synthesis.last_analysis_normalized = False
+                self.synthesis.last_analysis_repair_retry = False
                 self.synthesis.last_synthesis_model_used = False
                 self.synthesis.last_analysis_error = None
                 self.synthesis.last_synthesis_error = None
@@ -2400,6 +2427,9 @@ def document_qc(
     requirements_as_evidence = brief_evidence_issues(sections, all_evidence, final_markdown)
     external_gaps = external_research_disclosure_issues(spec, sections)
     readiness_issues: list[str] = []
+    analysis_errors = [section.title for section in sections if section.analysis_error]
+    if analysis_errors:
+        readiness_issues.append("Analysis model errors require review: " + ", ".join(analysis_errors[:6]) + ".")
     synthesis_errors = [section.title for section in sections if section.synthesis_error]
     if synthesis_errors:
         readiness_issues.append("Synthesis model errors require review: " + ", ".join(synthesis_errors[:6]) + ".")

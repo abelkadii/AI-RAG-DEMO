@@ -75,15 +75,28 @@ def test_section_analysis_accepts_equivalent_model_labels():
     analysis = SectionAnalysis.model_validate(
         {
             "section_id": "executive-summary",
-            "known_facts": [{"statement": "A phased engagement is requested.", "supporting_evidence_ids": ["E1"]}],
-            "evidence_claims": [{"claim": "The source identifies a roadmap.", "evidence_ids": ["E1"]}],
+            "requirements": [{"id": "R1", "requirement": "Assess organisational health", "source": "Client brief"}],
+            "known_facts": [
+                "Speckled Space displays a 4.9 Google Reviews rating. [E1]",
+                "The website lists a physical showroom. [E5]",
+            ],
+            "evidence_claims": [
+                {"claim": "The source identifies a roadmap.", "source_ids": ["E1"]},
+                "The public material describes a phased engagement. [E2]",
+            ],
             "analytical_inferences": [{"inference": "Sequencing should be validated."}],
             "hypotheses": [{"hypothesis": "A phased model may reduce execution risk."}],
         }
     )
-    assert analysis.known_facts[0].text == "A phased engagement is requested."
+    assert analysis.requirements == ["Assess organisational health"]
+    assert analysis.known_facts[0].text == "Speckled Space displays a 4.9 Google Reviews rating."
     assert analysis.known_facts[0].evidence_ids == ["E1"]
+    assert analysis.known_facts[1].text == "The website lists a physical showroom."
+    assert analysis.known_facts[1].evidence_ids == ["E5"]
     assert analysis.evidence_claims[0].text == "The source identifies a roadmap."
+    assert analysis.evidence_claims[0].evidence_ids == ["E1"]
+    assert analysis.evidence_claims[1].text == "The public material describes a phased engagement."
+    assert analysis.evidence_claims[1].evidence_ids == ["E2"]
     assert analysis.analytical_inferences == ["Sequencing should be validated."]
     assert analysis.hypotheses == ["A phased model may reduce execution risk."]
 
