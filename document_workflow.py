@@ -824,7 +824,7 @@ def build_long_form_section(
         )
         lens_index += 1
 
-    if len(claims) > 1:
+    if len(claims) > 1 and len({claim.chunk.chunk_id for claim in claims}) >= 3 and len({claim.chunk.page for claim in claims}) >= 2:
         grouped = join_claims(claims[: min(3, len(claims))]).lower()
         citations = " ".join(dict.fromkeys(citation_for_claim(claim, evidence) for claim in claims[:3]))
         paragraphs.append(
@@ -1299,6 +1299,33 @@ def cited_sentences(content: str) -> list[str]:
     return [item.strip() for item in re.split(r"(?<=[.!?؟])\s+", normalized) if "[" in item and "]" in item]
 
 
+def cited_sentences(content: str) -> list[str]:
+    """Split cited prose without treating the dot in ``file.pdf`` as a stop."""
+    normalized = re.sub(r"\n+", " ", content)
+    citations: list[str] = []
+
+    def protect(match: re.Match) -> str:
+        citations.append(match.group(0))
+        return f" CITATIONTOKEN{len(citations) - 1} "
+
+    protected = re.sub(r"\[[^\[\]\n]+? p\.\d+\]", protect, normalized)
+    restored: list[str] = []
+    # Question marks also appear as replacement glyphs in some extracted
+    # stage/heading text; treat them as ordinary characters for citation
+    # coverage so a heading cannot split a cited sentence in half.
+    for sentence in re.split(r"(?<=[.!])\s+", protected):
+        item = sentence.strip()
+        if "CITATIONTOKEN" not in item:
+            continue
+        item = re.sub(
+            r"CITATIONTOKEN(\d+)",
+            lambda match: citations[int(match.group(1))],
+            item,
+        )
+        restored.append(item)
+    return restored
+
+
 def pair_supports_sentence(pair: tuple[str, int], sentence: str, evidence: list[EvidenceChunk]) -> bool:
     lower_sentence = sentence.lower()
     # These are explicit provenance/coverage statements, not new factual
@@ -1395,6 +1422,7 @@ def summarize_section(content: str) -> str:
 
 
 def assemble_markdown(spec: DocumentSpec, plan: DocumentPlan, sections: list[GeneratedSection]) -> str:
+    brief_display = re.sub(r"\s+", " ", spec.client_brief).strip()
     lines = [
         f"# {plan.title}",
         "",
@@ -1404,7 +1432,7 @@ def assemble_markdown(spec: DocumentSpec, plan: DocumentPlan, sections: list[Gen
         f"**Client Sources:** {', '.join(spec.client_source_names) if spec.client_source_names else 'Client brief and supplied context'}",
         f"**Company Website:** {spec.company_website or 'None'}",
         "",
-        f"**Client Brief:** {spec.client_brief}",
+        f"**Client Brief:** {brief_display}",
         "",
     ]
     for section in sections:

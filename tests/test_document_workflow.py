@@ -15,6 +15,7 @@ from document_workflow import (
     filter_section_evidence,
     source_topic_labels,
     build_long_form_section,
+    cited_sentences,
 )
 from llm import LocalReasoner
 from models import AgentTrace, EvidenceChunk
@@ -438,6 +439,12 @@ def test_long_form_writer_avoids_known_filler_templates():
     assert "this gives the reader a grounded way" not in content.lower()
     assert "taken with the other retrieved passages" not in content.lower()
     assert "this section addresses" not in content.lower()
+
+
+def test_citation_sentence_split_does_not_break_pdf_filename():
+    sentences = cited_sentences("A supported statement uses the report evidence. [Strategy_Report.pdf p.12]")
+    assert len(sentences) == 1
+    assert "[Strategy_Report.pdf p.12]" in sentences[0]
 
 
 class FailsOnceQC:
