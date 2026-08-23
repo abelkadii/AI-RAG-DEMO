@@ -1,5 +1,5 @@
 from document_export import docx_bytes, markdown_bytes, pdf_bytes
-from document_models import DocumentSpec, GeneratedSection, SectionQC
+from document_models import DocumentSectionPlan, DocumentSpec, GeneratedSection, SectionQC
 from document_workflow import (
     DEFAULT_BRIEF,
     DocumentWorkflow,
@@ -12,6 +12,9 @@ from document_workflow import (
     extract_scope_items,
     analyze_reference_report,
     reference_leakage_issues,
+    filter_section_evidence,
+    source_topic_labels,
+    build_long_form_section,
 )
 from llm import LocalReasoner
 from models import AgentTrace, EvidenceChunk
@@ -153,6 +156,24 @@ def test_auto_summary_brief_uses_concise_summary_structure_without_roadmap():
     forbidden = ("Implementation Roadmap", "Prioritized Recommendations", "acceptance criteria", "rollout", "Priority 1")
     assert not any(term in trace.final_markdown for term in forbidden)
     assert trace.final_qc.passed
+
+
+def test_auto_summary_intent_overrides_default_standard_depth():
+    spec = DocumentSpec(
+        client_brief="what does this document talk about, explain briefly",
+        source_kind="uploaded",
+        deliverable_type="Auto",
+        target_depth="Standard",
+    )
+    assert resolve_deliverable_type(spec) == "Summary / Brief"
+    assert target_word_count(spec) is None
+    plan = make_workflow().plan(spec, [])
+    assert [section.section_id for section in plan.sections] == ["overview", "major-themes", "conclusion", "evidence"]
+
+
+def test_auto_methodology_summary_is_research_report_not_generic_brief():
+    spec = DocumentSpec(client_brief="summarize the methodology and findings", source_kind="uploaded")
+    assert resolve_deliverable_type(spec) == "Research Report"
 
 
 def test_document_workflow_does_not_research_references_section():
@@ -361,6 +382,62 @@ def test_pdf_export_is_a_valid_nonempty_pdf():
     output = pdf_bytes(trace)
     assert output.startswith(b"%PDF-")
     assert len(output) > 1000
+
+
+def test_source_survey_topics_are_semantic_not_retrieved_sentence_headings():
+    survey = [
+        EvidenceChunk(
+            chunk_id="one",
+            page=1,
+            source="client.pdf",
+            text="Manual prompting became the first major engineering bottleneck for the project.",
+            score=0.9,
+        ),
+        EvidenceChunk(
+            chunk_id="two",
+            page=2,
+            source="client.pdf",
+            text="The methodology evaluates the study using a controlled data collection approach and reports findings.",
+            score=0.8,
+        ),
+    ]
+    topics = source_topic_labels(survey)
+    assert topics
+    assert "Manual prompting became the first major engineering bottleneck" not in topics
+    assert any(topic in topics for topic in ("Methodology", "Key Findings"))
+
+
+def test_section_relevance_gate_rejects_tangential_chunks_and_caps_pages():
+    section = DocumentSectionPlan(
+        section_id="methodology",
+        title="Methodology",
+        objective="Explain the research method and evaluation approach.",
+        research_questions=["Which method and evaluation approach does the source document?"],
+    )
+    candidates = [
+        EvidenceChunk(chunk_id="primary", page=1, source="client.pdf", text="The methodology uses a controlled evaluation approach.", score=0.8),
+        EvidenceChunk(chunk_id="support", page=2, source="client.pdf", text="The study reports the evaluation method and sample design.", score=0.7),
+        EvidenceChunk(chunk_id="tangent", page=3, source="client.pdf", text="The company inventory lists office locations and unrelated staffing totals.", score=0.95),
+    ]
+    selected = filter_section_evidence(section, candidates, requested_k=8)
+    assert {chunk.chunk_id for chunk in selected} == {"primary", "support"}
+
+
+def test_long_form_writer_avoids_known_filler_templates():
+    spec = DocumentSpec(client_brief="Create a detailed report.", source_kind="uploaded", target_depth="Detailed")
+    section = DocumentSectionPlan(
+        section_id="findings",
+        title="Key Findings",
+        objective="Synthesize the source-backed findings.",
+        approximate_word_budget=300,
+        requirements=["findings"],
+    )
+    evidence = [EvidenceChunk(chunk_id="f1", page=4, source="client.pdf", text="The study reports a repeatable evaluation method and records measurable findings across the sample.", score=0.9)]
+    content = build_long_form_section(spec, section, evidence, [])
+    assert "the material also explains" not in content.lower()
+    assert "this gives the reader a grounded way" not in content.lower()
+    assert "taken with the other retrieved passages" not in content.lower()
+    assert "this section addresses" not in content.lower()
 
 
 class FailsOnceQC:

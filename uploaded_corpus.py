@@ -71,8 +71,10 @@ def extract_pdf_bytes(content: bytes, source: str) -> list[EvidenceChunk]:
     chunks: list[EvidenceChunk] = []
     prefix = hashlib.sha1(content).hexdigest()[:12]
     try:
-        for page_index, page in enumerate(document):
-            text = clean_uploaded_text(page.get_text("text"), source)
+        raw_pages = [page.get_text("text") for page in document]
+        repeated_lines = repeated_page_lines(raw_pages)
+        for page_index, raw_text in enumerate(raw_pages):
+            text = clean_uploaded_text(raw_text, source, repeated_lines=repeated_lines)
             for chunk_index, chunk_text in enumerate(split_page(text)):
                 if useful_chunk_text(chunk_text):
                     chunks.append(
@@ -132,11 +134,15 @@ def term_jaccard(first: str, second: str) -> float:
     return len(first_terms & second_terms) / len(first_terms | second_terms)
 
 
-def clean_uploaded_text(text: str, source: str) -> str:
+def clean_uploaded_text(text: str, source: str, repeated_lines: set[str] | None = None) -> str:
     """Clean uploaded PDF text without discarding non-Latin scripts."""
     lines = []
     source_stem = re.sub(r"\.pdf$", "", source, flags=re.I).replace("_", " ").replace("-", " ").strip().lower()
+    repeated_lines = repeated_lines or set()
     for raw_line in text.splitlines():
+        raw_normalized = re.sub(r"\s+", " ", raw_line).strip()
+        if raw_normalized.lower() in repeated_lines:
+            continue
         line = raw_line.translate(
             str.maketrans(
                 {
@@ -167,6 +173,22 @@ def clean_uploaded_text(text: str, source: str) -> str:
             continue
         lines.append(line)
     return clean_text(" ".join(lines))
+
+
+def repeated_page_lines(raw_pages: list[str]) -> set[str]:
+    """Identify short headers/footers repeated across multiple PDF pages."""
+    counts: dict[str, int] = {}
+    for page in raw_pages:
+        seen_on_page: set[str] = set()
+        for raw_line in page.splitlines():
+            line = re.sub(r"\s+", " ", raw_line).strip()
+            if not line or len(line) > 100 or len(re.findall(r"[\w\u0600-\u06FF]+", line)) > 10:
+                continue
+            seen_on_page.add(line.lower())
+        for line in seen_on_page:
+            counts[line] = counts.get(line, 0) + 1
+    minimum = 2 if len(raw_pages) < 5 else max(2, len(raw_pages) // 3)
+    return {line for line, count in counts.items() if count >= minimum}
 
 
 def repair_hyphenation_artifacts(text: str) -> str:
@@ -201,6 +223,13 @@ def useful_chunk_text(text: str) -> bool:
         return False
     if re.search(r"\b\d+\s*/\s*\d+\b", cleaned):
         return False
-    if looks_garbled(cleaned):
+    if looks_garbled(cleaned) or looks_mojibake(cleaned):
         return False
     return True
+
+
+def looks_mojibake(text: str) -> bool:
+    """Detect common UTF-8-as-Latin-1 artifacts without rejecting Arabic."""
+    markers = sum(text.count(marker) for marker in ("Ã", "Â", "â", "Ù", "Ø"))
+    words = max(1, len(re.findall(r"[A-Za-z\u0600-\u06FF]+", text)))
+    return markers >= 3 and markers / words > 0.08

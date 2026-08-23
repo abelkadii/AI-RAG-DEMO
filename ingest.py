@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import unicodedata
 import urllib.request
 from pathlib import Path
 
@@ -42,10 +43,15 @@ def download_pdf(url: str, destination: Path) -> None:
 
 
 def clean_text(text: str) -> str:
+    text = unicodedata.normalize("NFC", text)
     text = text.translate(
         str.maketrans({"\u00ad": "", "\xa0": " ", "\ufb00": "ff", "\ufb01": "fi", "\ufb02": "fl", "\ufb03": "ffi", "\ufb04": "ffl"})
     )
-    text = re.sub(r"(?<=\w)-\n(?=\w)", "", text)
+    # PDF extraction commonly inserts a line break or a space after a
+    # hyphen when a word wrapped at the page margin.  Join only alphabetic
+    # fragments; ordinary hyphenated compounds remain unchanged.
+    text = re.sub(r"(?<=[A-Za-z]{2})-\s*\n\s*(?=[a-z]{2})", "", text)
+    text = re.sub(r"(?<=[A-Za-z]{2})-\s+(?=[a-z]{2})", "", text)
     text = re.sub(r"\s+", " ", text)
     text = re.sub(r"^AWS Well-Architected Framework Framework\s*", "", text, flags=re.I)
     return text.strip()

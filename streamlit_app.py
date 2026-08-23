@@ -171,6 +171,7 @@ def apply_styles() -> None:
         }
         .terminal-feed .dim { color: #8aa0b8; }
         .terminal-feed .ok { color: #86efac; }
+        .terminal-feed .warn { color: #fbbf24; }
         .terminal-feed .err { color: #fca5a5; }
         .terminal-feed .cursor {
             display: inline-block;
@@ -285,8 +286,8 @@ def require_access_code() -> bool:
 
 
 def render_terminal(events: list[str], *, state: str = "running") -> str:
-    klass = "ok" if state == "complete" else "err" if state == "error" else "dim"
-    prefix = "✓ complete" if state == "complete" else "✕ failed" if state == "error" else "● running"
+    klass = "ok" if state == "complete" else "err" if state == "error" else "warn" if state == "warning" else "dim"
+    prefix = "✓ complete" if state == "complete" else "✕ failed" if state == "error" else "⚠ review required" if state == "warning" else "● running"
     lines = [f'<span class="{klass}">{escape(prefix)}</span>', ""]
     lines.extend(f"$ {escape(event)}" for event in events[-80:])
     if state == "running":
@@ -521,8 +522,13 @@ def document_studio() -> None:
                 feed_placeholder.markdown(render_terminal(events, state="error"), unsafe_allow_html=True)
                 st.error(f"Document generation failed: {error}")
                 return
-            events.append("Deliverable ready")
-            feed_placeholder.markdown(render_terminal(events, state="complete"), unsafe_allow_html=True)
+            if trace.final_qc.passed:
+                events.append("Deliverable ready")
+                feed_state = "complete"
+            else:
+                events.append("Draft generated — review required")
+                feed_state = "warning"
+            feed_placeholder.markdown(render_terminal(events, state=feed_state), unsafe_allow_html=True)
         st.session_state["document_trace"] = trace
 
     trace = st.session_state.get("document_trace")

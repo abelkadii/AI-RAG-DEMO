@@ -111,8 +111,10 @@ class DocumentQC(BaseModel):
     unique_pages_cited: int = 0
     cross_section_duplication: list[str] = Field(default_factory=list)
     contradictions: list[str] = Field(default_factory=list)
+    repetitive_prose_patterns: list[str] = Field(default_factory=list)
     unsupported_recommendations: list[str] = Field(default_factory=list)
     missing_scope_requirements: list[str] = Field(default_factory=list)
+    scope_coverage: dict[str, str] = Field(default_factory=dict)
     reference_leakage: list[str] = Field(default_factory=list)
 
 
