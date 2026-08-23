@@ -55,7 +55,9 @@ class Agent:
             stripped = line.strip()
             if not stripped:
                 continue
-            is_heading = len(stripped.split()) <= 4 and not stripped.endswith((".", "]"))
+            if stripped.startswith("#") or stripped.startswith(("**Knowledge Base:**", "**Audience:**", "**Client Brief:**")):
+                continue
+            is_heading = stripped.endswith(":") or len(stripped.split()) <= 4 and not stripped.endswith((".", "]"))
             if is_heading:
                 continue
             if Agent._is_status_statement(stripped):
@@ -138,7 +140,7 @@ class Agent:
         overlap = len(previous_ids & current_ids) / len(previous_ids | current_ids)
         return overlap >= 0.8 and cls._coverage_signature(previous.assessment) == cls._coverage_signature(current.assessment)
 
-    def run(self, question: str, on_iteration: Callable[[IterationTrace], None] | None = None):
+    def _search_loop(self, question: str, on_iteration: Callable[[IterationTrace], None] | None = None):
         if not question.strip():
             raise ValueError("Question cannot be empty")
         started = datetime.now(timezone.utc)
@@ -184,14 +186,10 @@ class Agent:
 
         if state.stop_reason is None:
             state.stop_reason = "no_evidence" if not state.gathered_evidence else "max_iterations"
+        return started, state, trace
 
-        if state.gathered_evidence:
-            state.final_answer = self.reasoner.answer(state)
-            state.final_answer, trace.citation_validation = self.validate_citations(
-                state.final_answer, state.gathered_evidence
-            )
-        else:
-            state.final_answer = "No evidence was retrieved, so an evidence-grounded answer cannot be generated."
+    @staticmethod
+    def _finish_trace(started: datetime, state: AgentState, trace: AgentTrace) -> AgentTrace:
         trace.stop_reason = state.stop_reason
         trace.final_answer = state.final_answer
         trace.total_iterations = len(trace.iterations)
@@ -200,7 +198,29 @@ class Agent:
         trace.completed_at = completed.isoformat()
         trace.duration_ms = int((completed - started).total_seconds() * 1000)
         trace.citations = sorted(
-            set(re.findall(r"\[AWS-WAF p\.\d+\]", state.final_answer)),
+            set(re.findall(r"\[AWS-WAF p\.\d+\]", state.final_answer or "")),
             key=lambda citation: int(re.search(r"\d+", citation).group()),
         )
+        return trace
+
+    def research(self, question: str, on_iteration: Callable[[IterationTrace], None] | None = None):
+        started, state, trace = self._search_loop(question, on_iteration)
+        state.final_answer = ""
+        trace.citation_validation = CitationValidation(
+            valid=True,
+            retrieved_pages=sorted({chunk.page for chunk in state.gathered_evidence}),
+        )
+        self._finish_trace(started, state, trace)
+        return state, trace
+
+    def run(self, question: str, on_iteration: Callable[[IterationTrace], None] | None = None):
+        started, state, trace = self._search_loop(question, on_iteration)
+        if state.gathered_evidence:
+            state.final_answer = self.reasoner.answer(state)
+            state.final_answer, trace.citation_validation = self.validate_citations(
+                state.final_answer, state.gathered_evidence
+            )
+        else:
+            state.final_answer = "No evidence was retrieved, so an evidence-grounded answer cannot be generated."
+        self._finish_trace(started, state, trace)
         return state, trace

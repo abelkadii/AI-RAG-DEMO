@@ -182,6 +182,24 @@ def test_structured_model_output_retries_after_malformed_json():
     assert result.search_query == "AWS reliability"
 
 
+def test_evidence_assessment_normalizes_model_returned_objects():
+    assessment = EvidenceAssessment.model_validate({
+        "sufficient": False,
+        "reason": "Need more.",
+        "supported_information": [{"text": "The AWS Well-Architected Framework is relevant.", "id": "aws-waf-p007-c00"}],
+        "partially_supported_information": [{"text": "The review process is mentioned.", "chunk_id": "aws-waf-p070-c00"}],
+        "unsupported_information": [],
+        "missing_information": [{"description": "Security evidence"}],
+    })
+    assert assessment.supported_information == [
+        "The AWS Well-Architected Framework is relevant. (aws-waf-p007-c00)"
+    ]
+    assert assessment.partially_supported_information == [
+        "The review process is mentioned. (aws-waf-p070-c00)"
+    ]
+    assert assessment.missing_information == ["Security evidence"]
+
+
 class FakeClient:
     def __init__(self, contents):
         self.chat = FakeChat(contents)

@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 
 class EvidenceChunk(BaseModel):
@@ -34,6 +34,38 @@ class EvidenceAssessment(BaseModel):
     supported_information: list[str] = Field(default_factory=list)
     partially_supported_information: list[str] = Field(default_factory=list)
     unsupported_information: list[str] = Field(default_factory=list)
+
+    @field_validator(
+        "missing_information",
+        "supported_information",
+        "partially_supported_information",
+        "unsupported_information",
+        mode="before",
+    )
+    @classmethod
+    def normalize_information_items(cls, value):
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            value = [value]
+        normalized = []
+        for item in value:
+            if isinstance(item, str):
+                normalized.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text") or item.get("label") or item.get("claim") or item.get("description")
+                identifier = item.get("chunk_id") or item.get("id") or item.get("page")
+                if text and identifier:
+                    normalized.append(f"{text} ({identifier})")
+                elif text:
+                    normalized.append(str(text))
+                elif identifier:
+                    normalized.append(str(identifier))
+                else:
+                    normalized.append(str(item))
+            else:
+                normalized.append(str(item))
+        return normalized
 
 
 class CitationValidation(BaseModel):

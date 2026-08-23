@@ -13,3 +13,4 @@ traces/
 .streamlit/secrets.toml
 output/
 streamlit-startup*.log
+streamlit-*.log
